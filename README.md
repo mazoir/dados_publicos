@@ -44,7 +44,7 @@ python pipeline_cooperados.py
 ```
 
 ## Última atualização
-05/02/2026 23:23
+05/02/2026 23:27
 
 ---
 *Gerado automaticamente pelo pipeline BCB.*
