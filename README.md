@@ -14,8 +14,16 @@ Repositório de dados públicos consolidados do Banco Central do Brasil, prontos
 **Colunas adicionadas:**
 | Coluna | Descrição |
 |--------|-----------|
-| `CNPJ` | Padronizado com zeros à esquerda (8 dígitos) |
-| `Periodo` | Formato `DD/MM/AAAA` (dia fixo = 01) |
+| `CNPJ` | Texto, padronizado com zeros à esquerda (8 dígitos) |
+| `Total de Cooperados` | Inteiro |
+| `Cooperados PF` | Inteiro |
+| `Cooperados PJ` | Inteiro |
+| `Sexo Feminino` | Inteiro |
+| `Sexo Masculino` | Inteiro |
+| `Sexo nao Informado` | Inteiro |
+| `Periodo` | Data (YYYY-MM-DD, dia fixo = 01) |
+
+> Coluna `Nome` removida para otimizar tamanho.
 
 ## 🔌 Uso no Power BI
 
@@ -25,9 +33,19 @@ Repositório de dados públicos consolidados do Banco Central do Brasil, prontos
 let
     Url = "https://raw.githubusercontent.com/mazoir/dados_publicos/main/dados/bcb/cooperados/cooperados_por_cooperativa.csv",
     Fonte = Csv.Document(Web.Contents(Url), [Delimiter=";", Encoding=65001, QuoteStyle=QuoteStyle.None]),
-    Cabecalho = Table.PromoteHeaders(Fonte, [PromoteAllScalars=true])
+    Cabecalho = Table.PromoteHeaders(Fonte, [PromoteAllScalars=true]),
+    Tipagem = Table.TransformColumnTypes(Cabecalho, {
+        {"CNPJ", type text},
+        {"Total de Cooperados", Int64.Type},
+        {"Cooperados PF", Int64.Type},
+        {"Cooperados PJ", Int64.Type},
+        {"Sexo Feminino", Int64.Type},
+        {"Sexo Masculino", Int64.Type},
+        {"Sexo nao Informado", Int64.Type},
+        {"Periodo", type date}
+    })
 in
-    Cabecalho
+    Tipagem
 ```
 
 **Configuração no Power BI Service (refresh agendado):**
@@ -44,7 +62,7 @@ python pipeline_cooperados.py
 ```
 
 ## Última atualização
-05/02/2026 23:27
+05/02/2026 23:33
 
 ---
 *Gerado automaticamente pelo pipeline BCB.*
