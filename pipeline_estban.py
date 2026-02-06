@@ -101,18 +101,18 @@ DOWNLOAD_RETRIES = 3
 
 # Verbetes individuais a manter (número → nome amigável)
 VERBETES_INDIVIDUAIS = {
-    160: "OP_CREDITO_TOTAL",
-    161: "EMPRESTIMOS_TITULOS",
-    162: "FINANCIAMENTOS",
-    163: "FIN_RURAIS_AGRICOLA",
-    167: "FIN_AGROINDUSTRIAIS",
-    169: "FIN_IMOBILIARIOS",
-    171: "OUTRAS_OP_CREDITO",
-    174: "PROVISAO_CREDITO",
-    399: "ATIVO_TOTAL",
-    420: "DEP_POUPANCA",
-    432: "DEP_PRAZO",
-    610: "PATRIMONIO_LIQUIDO",
+    160: "Operações de Crédito Total",
+    161: "Empréstimos e Títulos Descontados",
+    162: "Financiamentos",
+    163: "Financiamentos Rurais Agrícola",
+    167: "Financiamentos Agroindustriais",
+    169: "Financiamentos Imobiliários",
+    171: "Outras Operações de Crédito",
+    174: "Provisão para Créditos de Liquidação Duvidosa",
+    399: "Ativo Total",
+    420: "Depósitos de Poupança",
+    432: "Depósitos a Prazo",
+    610: "Patrimônio Líquido",
 }
 
 # Verbetes de depósito à vista (401-419) → serão consolidados
@@ -135,34 +135,31 @@ COLUNAS_ID_POSSIVEIS = [
 
 # Colunas finais de saída (ordem)
 COLUNAS_SAIDA_ID = [
-    "DATA_BASE",
-    "UF",
+    "Período",
     "CODMUN",
-    "MUNICIPIO",
     "CNPJ",
-    "NOME_INSTITUICAO",
 ]
 
 COLUNAS_SAIDA_VERBETES = [
-    "OP_CREDITO_TOTAL",
-    "EMPRESTIMOS_TITULOS",
-    "FINANCIAMENTOS",
-    "FIN_RURAIS_AGRICOLA",
-    "FIN_AGROINDUSTRIAIS",
-    "FIN_IMOBILIARIOS",
-    "OUTRAS_OP_CREDITO",
-    "PROVISAO_CREDITO",
-    "ATIVO_TOTAL",
-    "DEP_VISTA_TOTAL",
-    "DEP_POUPANCA",
-    "DEP_PRAZO",
-    "PATRIMONIO_LIQUIDO",
+    "Operações de Crédito Total",
+    "Empréstimos e Títulos Descontados",
+    "Financiamentos",
+    "Financiamentos Rurais Agrícola",
+    "Financiamentos Agroindustriais",
+    "Financiamentos Imobiliários",
+    "Outras Operações de Crédito",
+    "Provisão para Créditos de Liquidação Duvidosa",
+    "Ativo Total",
+    "Depósitos à Vista Total",
+    "Depósitos de Poupança",
+    "Depósitos a Prazo",
+    "Patrimônio Líquido",
 ]
 
 COLUNAS_SAIDA_KPIS = [
-    "IDX_PROVISAO_CREDITO",
-    "PENETRACAO_RURAL",
-    "MIX_POUPANCA",
+    "Índice Provisão / Crédito (%)",
+    "Penetração Rural (%)",
+    "Mix Poupança (%)",
 ]
 
 
@@ -478,24 +475,13 @@ def transformar_dataframe(df: pd.DataFrame, periodo: str) -> Optional[pd.DataFra
 
     # Colunas de identificação
     if "DATA_BASE" in colunas_id:
-        resultado["DATA_BASE"] = df[colunas_id["DATA_BASE"]].astype(str).str.strip()
+        resultado["Período"] = df[colunas_id["DATA_BASE"]].astype(str).str.strip()
     else:
         # Usa o período do arquivo como fallback
-        resultado["DATA_BASE"] = periodo
-
-    if "UF" in colunas_id:
-        resultado["UF"] = df[colunas_id["UF"]].astype(str).str.strip()
+        resultado["Período"] = periodo
 
     if "CODMUN" in colunas_id:
         resultado["CODMUN"] = df[colunas_id["CODMUN"]].astype(str).str.strip()
-
-    if "MUNICIPIO" in colunas_id:
-        resultado["MUNICIPIO"] = (
-            df[colunas_id["MUNICIPIO"]]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-        )
 
     if "CNPJ" in colunas_id:
         resultado["CNPJ"] = (
@@ -505,13 +491,6 @@ def transformar_dataframe(df: pd.DataFrame, periodo: str) -> Optional[pd.DataFra
             .str.replace(r"\D", "", regex=True)
             .str.zfill(8)
             .str[:8]  # Primeiros 8 dígitos (raiz do CNPJ)
-        )
-
-    if "NOME_INSTITUICAO" in colunas_id:
-        resultado["NOME_INSTITUICAO"] = (
-            df[colunas_id["NOME_INSTITUICAO"]]
-            .astype(str)
-            .str.strip()
         )
 
     # --- Verbetes individuais ---
@@ -530,43 +509,43 @@ def transformar_dataframe(df: pd.DataFrame, periodo: str) -> Optional[pd.DataFra
 
     if cols_dep_vista:
         dep_vista_df = df[cols_dep_vista].apply(_converter_numerico)
-        resultado["DEP_VISTA_TOTAL"] = dep_vista_df.sum(axis=1)
+        resultado["Depósitos à Vista Total"] = dep_vista_df.sum(axis=1)
     else:
-        resultado["DEP_VISTA_TOTAL"] = 0.0
+        resultado["Depósitos à Vista Total"] = 0.0
 
     # --- KPIs derivados ---
     # 1. Índice Provisão/Crédito (%)
-    #    |PROVISAO_CREDITO| / OP_CREDITO_TOTAL * 100
+    #    |Provisão| / Operações de Crédito Total * 100
     #    Provisão é negativa no COSIF, usar valor absoluto
-    resultado["IDX_PROVISAO_CREDITO"] = (
-        resultado["PROVISAO_CREDITO"].abs()
-        / resultado["OP_CREDITO_TOTAL"].replace(0, float("nan"))
+    resultado["Índice Provisão / Crédito (%)"] = (
+        resultado["Provisão para Créditos de Liquidação Duvidosa"].abs()
+        / resultado["Operações de Crédito Total"].replace(0, float("nan"))
         * 100
     ).round(2)
 
     # 2. Penetração Rural (%)
-    #    FIN_RURAIS_AGRICOLA / OP_CREDITO_TOTAL * 100
-    resultado["PENETRACAO_RURAL"] = (
-        resultado["FIN_RURAIS_AGRICOLA"]
-        / resultado["OP_CREDITO_TOTAL"].replace(0, float("nan"))
+    #    Financiamentos Rurais / Operações de Crédito Total * 100
+    resultado["Penetração Rural (%)"] = (
+        resultado["Financiamentos Rurais Agrícola"]
+        / resultado["Operações de Crédito Total"].replace(0, float("nan"))
         * 100
     ).round(2)
 
     # 3. Mix Poupança (%)
-    #    DEP_POUPANCA / (DEP_VISTA_TOTAL + DEP_POUPANCA + DEP_PRAZO) * 100
+    #    Depósitos de Poupança / (Dep. Vista + Poupança + Prazo) * 100
     total_captacao = (
-        resultado["DEP_VISTA_TOTAL"]
-        + resultado["DEP_POUPANCA"]
-        + resultado["DEP_PRAZO"]
+        resultado["Depósitos à Vista Total"]
+        + resultado["Depósitos de Poupança"]
+        + resultado["Depósitos a Prazo"]
     )
-    resultado["MIX_POUPANCA"] = (
-        resultado["DEP_POUPANCA"]
+    resultado["Mix Poupança (%)"] = (
+        resultado["Depósitos de Poupança"]
         / total_captacao.replace(0, float("nan"))
         * 100
     ).round(2)
 
-    # --- Formatar DATA_BASE como date (YYYY-MM-01) ---
-    resultado["DATA_BASE"] = resultado["DATA_BASE"].apply(_formatar_data_base)
+    # --- Formatar Período como date (YYYY-MM-01) ---
+    resultado["Período"] = resultado["Período"].apply(_formatar_data_base)
 
     # Preencher NaN nos KPIs com None (será vazio no CSV)
     for col_kpi in COLUNAS_SAIDA_KPIS:
@@ -704,9 +683,9 @@ def executar_pipeline(inicio: str, fim: str, fazer_push: bool = True):
 
     df_final = pd.concat(dfs, ignore_index=True)
 
-    # Ordenar: DATA_BASE, UF, MUNICIPIO, NOME_INSTITUICAO
+    # Ordenar: Período, CODMUN, CNPJ
     df_final = df_final.sort_values(
-        ["DATA_BASE", "UF", "MUNICIPIO", "NOME_INSTITUICAO"],
+        ["Período", "CODMUN", "CNPJ"],
         ignore_index=True,
     )
 
@@ -724,11 +703,9 @@ def executar_pipeline(inicio: str, fim: str, fazer_push: bool = True):
 
     # Estatísticas
     print(f"\n  Resumo dos dados:")
-    print(f"    UFs distintas        : {df_final['UF'].nunique()}")
-    if "CODMUN" in df_final.columns:
-        print(f"    Municípios distintos : {df_final['CODMUN'].nunique():,}")
-    print(f"    Instituições distintas: {df_final['NOME_INSTITUICAO'].nunique():,}")
-    print(f"    Período              : {df_final['DATA_BASE'].min()} a {df_final['DATA_BASE'].max()}")
+    print(f"    Municípios distintos : {df_final['CODMUN'].nunique():,}")
+    print(f"    CNPJs distintos     : {df_final['CNPJ'].nunique():,}")
+    print(f"    Período              : {df_final['Período'].min()} a {df_final['Período'].max()}")
 
     # 5. Salvar CSV
     print(f"\n[4/6] Salvando arquivo...")
@@ -854,53 +831,50 @@ Repositório de dados públicos consolidados do Banco Central do Brasil, prontos
 
 | Coluna | Tipo | Descrição |
 | --- | --- | --- |
-| `DATA_BASE` | date | Data de referência (YYYY-MM-01) |
-| `UF` | text | Unidade Federativa |
+| `Período` | date | Data de referência (YYYY-MM-01) |
 | `CODMUN` | text | Código do município (BCB) |
-| `MUNICIPIO` | text | Nome do município |
 | `CNPJ` | text | CNPJ raiz da IF (8 dígitos) |
-| `NOME_INSTITUICAO` | text | Nome da instituição financeira |
 
 **Colunas de Crédito (Ativo):**
 
 | Coluna | Verbete | Descrição |
 | --- | --- | --- |
-| `OP_CREDITO_TOTAL` | 160 | Total de Operações de Crédito |
-| `EMPRESTIMOS_TITULOS` | 161 | Empréstimos e Títulos Descontados (Capital de Giro) |
-| `FINANCIAMENTOS` | 162 | Financiamentos (Veículos, Bens) |
-| `FIN_RURAIS_AGRICOLA` | 163 | Financiamentos Rurais - Custeio/Investimento Agrícola |
-| `FIN_AGROINDUSTRIAIS` | 167 | Financiamentos Agroindustriais |
-| `FIN_IMOBILIARIOS` | 169 | Financiamentos Imobiliários |
-| `OUTRAS_OP_CREDITO` | 171 | Outras Operações de Crédito (PF) |
+| `Operações de Crédito Total` | 160 | Total de Operações de Crédito |
+| `Empréstimos e Títulos Descontados` | 161 | Empréstimos e Títulos Descontados (Capital de Giro) |
+| `Financiamentos` | 162 | Financiamentos (Veículos, Bens) |
+| `Financiamentos Rurais Agrícola` | 163 | Financiamentos Rurais - Custeio/Investimento Agrícola |
+| `Financiamentos Agroindustriais` | 167 | Financiamentos Agroindustriais |
+| `Financiamentos Imobiliários` | 169 | Financiamentos Imobiliários |
+| `Outras Operações de Crédito` | 171 | Outras Operações de Crédito (PF) |
 
 **Colunas de Risco:**
 
 | Coluna | Verbete | Descrição |
 | --- | --- | --- |
-| `PROVISAO_CREDITO` | 174 | Provisão p/ Créditos de Liquidação Duvidosa |
+| `Provisão para Créditos de Liquidação Duvidosa` | 174 | Provisão p/ Créditos de Liquidação Duvidosa |
 
 **Colunas de Captação (Passivo):**
 
 | Coluna | Verbete | Descrição |
 | --- | --- | --- |
-| `DEP_VISTA_TOTAL` | 401-419 | Depósitos à Vista (consolidado) |
-| `DEP_POUPANCA` | 420 | Depósitos de Poupança |
-| `DEP_PRAZO` | 432 | Depósitos a Prazo (CDB/RDB) |
+| `Depósitos à Vista Total` | 401-419 | Depósitos à Vista (consolidado) |
+| `Depósitos de Poupança` | 420 | Depósitos de Poupança |
+| `Depósitos a Prazo` | 432 | Depósitos a Prazo (CDB/RDB) |
 
 **Colunas Patrimoniais:**
 
 | Coluna | Verbete | Descrição |
 | --- | --- | --- |
-| `ATIVO_TOTAL` | 399 | Total do Ativo |
-| `PATRIMONIO_LIQUIDO` | 610 | Patrimônio Líquido |
+| `Ativo Total` | 399 | Total do Ativo |
+| `Patrimônio Líquido` | 610 | Patrimônio Líquido |
 
 **KPIs Derivados:**
 
 | Coluna | Fórmula | Descrição |
 | --- | --- | --- |
-| `IDX_PROVISAO_CREDITO` | abs(174) / 160 × 100 | Índice de provisão sobre crédito (%) |
-| `PENETRACAO_RURAL` | 163 / 160 × 100 | Participação do crédito rural no total (%) |
-| `MIX_POUPANCA` | 420 / (401-419 + 420 + 432) × 100 | Peso da poupança na captação total (%) |
+| `Índice Provisão / Crédito (%)` | abs(174) / 160 × 100 | Índice de provisão sobre crédito (%) |
+| `Penetração Rural (%)` | 163 / 160 × 100 | Participação do crédito rural no total (%) |
+| `Mix Poupança (%)` | 420 / (401-419 + 420 + 432) × 100 | Peso da poupança na captação total (%) |
 
 ---
 
@@ -934,31 +908,30 @@ in
 ```
 let
     Url = "https://raw.githubusercontent.com/mazoir/dados_publicos/main/dados/bcb/estban/{arquivo_nome}",
-    Fonte = Csv.Document(Web.Contents(Url), [Delimiter=";", Encoding=65001, QuoteStyle=QuoteStyle.None]),
+    Download = Web.Contents(Url),
+    Descomprimido = Binary.Decompress(Download, Compression.GZip),
+    Fonte = Csv.Document(Descomprimido, [Delimiter=";", Encoding=65001, QuoteStyle=QuoteStyle.None]),
     Cabecalho = Table.PromoteHeaders(Fonte, [PromoteAllScalars=true]),
     Tipagem = Table.TransformColumnTypes(Cabecalho, {{
-        {{"DATA_BASE", type date}},
-        {{"UF", type text}},
+        {{"Período", type date}},
         {{"CODMUN", type text}},
-        {{"MUNICIPIO", type text}},
         {{"CNPJ", type text}},
-        {{"NOME_INSTITUICAO", type text}},
-        {{"OP_CREDITO_TOTAL", type number}},
-        {{"EMPRESTIMOS_TITULOS", type number}},
-        {{"FINANCIAMENTOS", type number}},
-        {{"FIN_RURAIS_AGRICOLA", type number}},
-        {{"FIN_AGROINDUSTRIAIS", type number}},
-        {{"FIN_IMOBILIARIOS", type number}},
-        {{"OUTRAS_OP_CREDITO", type number}},
-        {{"PROVISAO_CREDITO", type number}},
-        {{"ATIVO_TOTAL", type number}},
-        {{"DEP_VISTA_TOTAL", type number}},
-        {{"DEP_POUPANCA", type number}},
-        {{"DEP_PRAZO", type number}},
-        {{"PATRIMONIO_LIQUIDO", type number}},
-        {{"IDX_PROVISAO_CREDITO", type number}},
-        {{"PENETRACAO_RURAL", type number}},
-        {{"MIX_POUPANCA", type number}}
+        {{"Operações de Crédito Total", type number}},
+        {{"Empréstimos e Títulos Descontados", type number}},
+        {{"Financiamentos", type number}},
+        {{"Financiamentos Rurais Agrícola", type number}},
+        {{"Financiamentos Agroindustriais", type number}},
+        {{"Financiamentos Imobiliários", type number}},
+        {{"Outras Operações de Crédito", type number}},
+        {{"Provisão para Créditos de Liquidação Duvidosa", type number}},
+        {{"Ativo Total", type number}},
+        {{"Depósitos à Vista Total", type number}},
+        {{"Depósitos de Poupança", type number}},
+        {{"Depósitos a Prazo", type number}},
+        {{"Patrimônio Líquido", type number}},
+        {{"Índice Provisão / Crédito (%)", type number}},
+        {{"Penetração Rural (%)", type number}},
+        {{"Mix Poupança (%)", type number}}
     }})
 in
     Tipagem
