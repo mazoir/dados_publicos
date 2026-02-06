@@ -187,7 +187,7 @@ python pipeline_estban.py --inicio 2024-01 --fim 2025-09
 
 ## Última atualização
 
-06/02/2026 00:12
+06/02/2026 00:14
 
 ---
 
