@@ -36,7 +36,7 @@ Ele baixa os microdados oficiais da **RAIS** (vínculos e estabelecimentos) e do
 Como o pipeline funciona, em cinco etapas:
 
 1. **Descoberta.** Lista o FTP e encontra todos os arquivos do período. Anos e meses novos e republicações do MTE são detectados sozinhos. A pasta `Legado` do Novo CAGED é ignorada.
-2. **Download.** Roda em paralelo, retoma arquivos `.part` interrompidos (só se o arquivo no FTP ainda for o mesmo: o `.part` leva tamanho e data no nome) e tenta de novo com espera crescente. O tamanho baixado é conferido com o do FTP e a integridade com o CRC do 7-Zip. Se o arquivo mudar no FTP durante o download, o item fica em erro na hora, sem baixar tudo de novo várias vezes, e volta na próxima execução.
+2. **Download.** Roda em paralelo, retoma arquivos `.part` interrompidos (só se o arquivo no FTP ainda for o mesmo: o `.part` leva tamanho e data no nome) e tenta de novo com espera crescente. O tamanho baixado é conferido com o do FTP e a integridade com o CRC do 7-Zip. Se o arquivo crescer no FTP durante o download (republicação), o item fica em erro na hora (`REPUBLICADO_DURANTE_DOWNLOAD`), sem baixar tudo de novo várias vezes, e volta na próxima execução. Se encolher, fica em erro depois das tentativas (tamanho divergente); se mudar mantendo o tamanho, o CRC do 7-Zip acusa e o arquivo é baixado de novo uma vez.
 3. **Extração em streaming.** O comando é `7z e -so`. O TXT descompactado, que passa de 5 GB por ano na RAIS de MG/ES/RJ, nunca é gravado em disco.
 4. **Transformação.** O motor padrão é C#, compilado em memória via `Add-Type`. O motor PowerShell puro serve de contingência e gera saída byte a byte idêntica. A etapa filtra a UF, unifica os layouts de todos os anos, limpa e normaliza os valores e cria as colunas derivadas.
 5. **Carga.** Grava os CSVs em UTF-8 e, em `_controle`, o manifesto com contagens e métricas, o dicionário de colunas, o mapeamento de cabeçalhos e a DDL para SQL Server. Se pedido, consolida tudo em um arquivo por grupo.
@@ -129,7 +129,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | `-Caminho7Zip` | automático | Caminho do `7z.exe` (pode ser relativo à pasta atual) |
 | `-Baixar7Zip` | desligado | Se não achar o 7-Zip, baixa o `7zr.exe` oficial |
 | `-Motor` | `Auto` | `Auto` usa C# se possível e PowerShell como contingência. Também aceita `CSharp` ou `PowerShell` |
-| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: a retomada pode não funcionar, o download não é conferido pelo tamanho e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos) |
+| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: um download interrompido recomeça do zero, o download não é conferido pelo tamanho e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos). Alternar entre conexão direta e proxy na mesma pasta não marca nada como republicado; só os arquivos processados apenas pelo proxy são reprocessados uma vez, na primeira execução com conexão direta (o manifesto não tinha tamanho e data para comparar) |
 | `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados |
 | `-Tentativas` | `5` | Tentativas por listagem ou download, de 1 a 20 |
 | `-SomenteListar` | desligado | Simulação: lista o que seria baixado e processado |
@@ -139,7 +139,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | Código | Significado |
 | --- | --- |
 | `0` | Sucesso |
-| `1` | Terminou, mas algo ficou pendente: arquivo em erro (veja o manifesto), pasta do FTP que não pôde ser listada, consolidação recusada ou manifesto gravado só como `.pendente.csv` |
+| `1` | Terminou, mas algo ficou pendente: arquivo em erro (veja o manifesto), pasta do FTP que não pôde ser listada, consolidação recusada ou manifesto/mapeamento gravado só como `.pendente.csv` |
 | `2` | Falha geral, outra execução usando a mesma pasta ou interrupção com Ctrl+C |
 
 ---
@@ -163,7 +163,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 │   ├── ddl_sqlserver_MG.sql             CREATE TABLE de staging + modelo de BULK INSERT
 │   ├── execucao.lock                    trava: uma execução por vez nesta pasta
 │   ├── *.pendente.csv                   (só se o manifesto/mapeamento estava aberto no Excel; incorporado na próxima execução)
-│   └── logs\execucao_MG_<data_hora>.log
+│   └── logs\execucao_MG_<data_hora>_<PID>.log
 ├── _downloads\             .7z temporários (apagados após o processamento, salvo -ManterCompactados)
 └── _ferramentas\           7zr.exe (só com -Baixar7Zip)
 ```
@@ -187,7 +187,7 @@ No modo **Descritivo**, a ordem é a mesma, com os rótulos em português da col
 
 Os tipos determinam o tratamento:
 
-- **texto:** só trim e nulos. **Zeros à esquerda são preservados** (CBO, CNAE, natureza jurídica, município, CEP). O CEP sai sempre com 8 dígitos: o layout 2023+ da RAIS Estabelecimentos publica o CEP como número (`7112000`) e o script devolve o zero à esquerda (`07112000`). Em MG os CEPs começam com 3 e não mudam.
+- **texto:** só trim e nulos. **Zeros à esquerda são preservados** (CBO, CNAE, natureza jurídica, município, CEP). O CEP numérico de 7 dígitos ganha o zero à esquerda: o layout 2023+ da RAIS Estabelecimentos publica o CEP como número (`7112000` → `07112000`). Outros valores (ex.: `0`) ficam como publicados e, com `-ManterValoresBrutos`, nada muda (seção 8). Em MG os CEPs começam com 3 e não mudam.
 - **inteiro** e **decimal:** normalização numérica (seção 8).
 
 #### RAIS Vínculos
@@ -383,17 +383,17 @@ O `_controle\manifesto_MG.csv` tem uma linha por arquivo de origem. Os campos ma
 | --- | --- |
 | `status` | `OK`, `SEM_DADOS` (o arquivo não tem registros da UF; normal no `NI`) ou `ERRO` (veja `mensagem`; a próxima execução tenta de novo) |
 | `linhas_lidas` / `linhas_saida` | registros do Brasil (ou da região) lidos e registros da UF gravados |
-| `linhas_irregulares` | registros malformados (deveria ser 0): número de campos diferente do cabeçalho ou aspas sem fechamento. Os da UF são ajustados e gravados; os que não têm a coluna do filtro, ou cuja coluna da UF pode estar deslocada, são descartados. Os 5 primeiros de cada arquivo aparecem no log com o número da linha |
+| `linhas_irregulares` | registros malformados (deveria ser 0): número de campos diferente do cabeçalho ou aspas sem fechamento. Os da UF são todos contados, ajustados e gravados. Fora da UF são contados (e descartados) os curtos demais para ter a coluna do filtro, os com aspas sem fechamento, os com aspas na fonte que usa aspas (RAIS 2023+) e aqueles cuja coluna da UF não traz um código de UF/município válido (sinal de coluna deslocada). Por desempenho, nos formatos `;` (RAIS até 2022 e Novo CAGED), um registro de outra UF com código de UF válido e campos a mais ou a menos é descartado sem contagem. Os 5 primeiros de cada arquivo aparecem no log com o número da linha |
 | `metrica_soma` | RAIS Vínculos: soma de `vinculo_ativo_3112`, o **estoque em 31/12**. RAIS Estab.: soma de `qtd_vinculos_ativos`. CAGED: soma de `saldo_movimentacao` |
 | `metrica_positivos` / `metrica_negativos` | no CAGED: admissões e desligamentos do arquivo |
 | `tamanho_remoto` / `data_remota` | detectam republicação pelo MTE, que leva a novo download |
-| `assinatura` | configuração que gerou a saída: UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado |
+| `assinatura` | configuração que gerou a saída: versão do layout de saída (`L2` na versão 1.1.0 do script), UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado. Por isso, depois de atualizar o script para uma versão com outro layout, a primeira execução reprocessa tudo uma vez (e baixa de novo o que não estiver em `_downloads`; com `-ManterCompactados` os `.7z` ficam guardados) |
 
 No final da execução, o log mostra um resumo por grupo e a **conferência da carga do Novo CAGED por ano do arquivo** (MOV + FOR − EXC). Ela confere a carga (deve bater com a soma de `saldo_movimentacao` dos CSVs), mas agrupa pelo ano do **nome** do arquivo. O "saldo com ajustes" do painel oficial soma FOR e subtrai EXC na `competencia_movimentacao` de cada linha; para comparar com o painel, use a consulta da [seção 11](#11-sql-server). A soma só do MOV por ano corresponde ao saldo "sem ajustes". O `metrica_soma` da RAIS Vínculos pode ser comparado com o estoque oficial de MG.
 
 O `dicionario_colunas.csv` traz, na coluna `observacao`, as mudanças de significado de códigos entre layouts e como somar o saldo do CAGED.
 
-**Arquivos de controle abertos no Excel** não derrubam a execução. Manifesto bloqueado: o script avisa, continua os downloads, tenta gravar a cada arquivo concluído e, no fim, grava `manifesto_MG.pendente.csv` (código de saída 1), que a execução seguinte incorpora sozinha. O mapeamento segue a mesma regra. Dicionário e DDL bloqueados só geram aviso; eles são regravados na próxima execução.
+**Arquivos de controle abertos no Excel** não derrubam a execução. Com o manifesto ou o mapeamento bloqueado, o script avisa, continua os downloads e tenta gravar o arquivo a cada arquivo concluído. Enquanto ele estiver bloqueado, o progresso vai para `<nome>.pendente.csv` (ex.: `manifesto_MG.pendente.csv`), e por isso uma interrupção não perde o que já foi processado. No fim, se o arquivo continuar bloqueado depois de 30 s de novas tentativas, fica o `.pendente.csv` (código de saída 1). A execução seguinte o incorpora sozinha, mesmo quando não há nada novo para processar. Um `.pendente.csv` mais antigo que o principal (ex.: o principal foi salvo depois pelo Excel) não é incorporado: ele fica guardado como `<nome>.pendente_ignorado_<data_hora>.csv` para conferência. Dicionário e DDL bloqueados só geram aviso; eles são regravados na próxima execução.
 
 ---
 
@@ -526,7 +526,7 @@ Register-ScheduledTask -TaskName 'MTE - RAIS e Novo CAGED (MG)' -Action $acao -T
     -Description 'Atualiza incrementalmente RAIS e Novo CAGED filtrados para MG'
 ```
 
-O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada.
+O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada. Cada execução grava o próprio log (o nome leva data, hora e PID).
 
 ---
 
@@ -551,19 +551,23 @@ Os números são **ordens de grandeza para MG**. Os exatos de download aparecem 
 
 | Sintoma | Causa provável e solução |
 | --- | --- |
-| Não lista o FTP / timeout | A rede bloqueia FTP (porta 21 e portas passivas). Teste `Test-NetConnection ftp.mtps.gov.br -Port 21`. Se só houver proxy, use `-UsarProxySistema`; senão, rode de outra rede. O FTP do MTE também fica fora do ar às vezes: rode de novo mais tarde, porque a execução é incremental |
+| Não lista o FTP / timeout | A rede bloqueia FTP (porta 21 e portas passivas). Teste `Test-NetConnection ftp.mtps.gov.br -Port 21`. Se só houver proxy, use `-UsarProxySistema` no Windows PowerShell 5.1 (no PowerShell 7 ele não tem efeito); senão, rode de outra rede. O FTP do MTE também fica fora do ar às vezes: rode de novo mais tarde, porque a execução é incremental |
 | "7-Zip não encontrado" | Instale o 7-Zip, informe `-Caminho7Zip` ou use `-Baixar7Zip` |
+| "-Caminho7Zip ... não existe ou não respondeu como 7-Zip" | O caminho não existe nesta sessão (ex.: unidade de rede que o Agendador não enxerga) ou não é o `7z.exe` (o `7zFM.exe` e o `7zG.exe` abrem janela e são encerrados após 30 s). O script procura outra instalação sozinho |
 | "não pode ser carregado porque a execução de scripts foi desabilitada" | `Unblock-File` + `-ExecutionPolicy Bypass` (seção 3) |
 | Acentos estranhos nas mensagens | O `.ps1` perdeu o BOM ao ser editado: salve como UTF-8 com BOM. O log em arquivo é sempre UTF-8 |
 | Log avisa que o motor C# não compilou | Política de segurança bloqueando o compilador (`csc.exe`) ou falta do .NET Framework 4.5+. O script segue com o motor PowerShell: mesma saída, porém mais lento |
 | `status = ERRO` no manifesto | Veja a coluna `mensagem` e o log. A próxima execução tenta de novo só o que ficou pendente. Em `ARQUIVO_CORROMPIDO` o arquivo já é baixado de novo uma vez, sozinho |
 | Arquivo de saída em uso | Feche o CSV no Excel ou no Power BI Desktop antes de rodar. Só aquele arquivo fica em erro; a próxima execução tenta de novo |
-| "Outra execução do script já está usando a pasta" | Há outra execução (agendada ou manual) na mesma `-Saida`. Espere ela terminar. Se nenhuma estiver rodando, a trava é liberada sozinha quando o processo antigo termina |
-| "Manifesto não gravado" / `manifesto_MG.pendente.csv` | O manifesto estava aberto (ex.: Excel). Feche-o; a próxima execução incorpora o `.pendente.csv` sozinha |
+| "Outra execução do script já está usando a pasta" | Há outra execução (agendada ou manual) na mesma `-Saida`. Espere ela terminar. A trava é liberada sozinha quando o processo antigo termina, mesmo depois de uma queda |
+| "Sem permissão para criar ou abrir a trava" | `_controle\execucao.lock` está como somente leitura ou pertence a outra conta (ex.: tarefa agendada com outro usuário). Ajuste as permissões ou apague o arquivo quando nenhuma execução estiver rodando |
+| "Manifesto não gravado" / `*.pendente.csv` | O manifesto ou o mapeamento estava aberto (ex.: Excel). Feche-o; a próxima execução incorpora o `.pendente.csv` sozinha |
+| `*.pendente_ignorado_<data_hora>.csv` | Um `.pendente.csv` era mais antigo que o arquivo principal (ex.: o principal foi salvo depois pelo Excel) e não foi incorporado. Confira e apague. Se ele tiver o que faltou, os arquivos ausentes do manifesto são reprocessados na próxima execução |
 | "Consolidação de ... falhou: período(s) gerado(s) com outra configuração" | Parte dos arquivos foi gerada com outro decimal, delimitador ou cabeçalho. Rode o período completo com a configuração desejada (ou `-Reprocessar`); o consolidado anterior foi mantido |
 | "Pasta ignorada nesta execução" | Uma pasta de ano/mês do FTP não pôde ser listada. O restante foi processado (código 1); a pasta volta na próxima execução |
-| `REPUBLICADO_DURANTE_DOWNLOAD` | O arquivo mudou no FTP durante a execução. Ele é baixado de novo na próxima |
-| Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados e nenhum CSV parcial (`.tmp`) é mantido. Código de saída `2` |
+| `REPUBLICADO_DURANTE_DOWNLOAD` | O arquivo cresceu no FTP durante a execução (republicação). Ele é baixado de novo na próxima |
+| Primeira execução depois de atualizar o script reprocessa tudo | A versão do layout de saída mudou (ex.: 1.0.0 → 1.1.0) e, com ela, a assinatura do manifesto. Acontece uma vez; com `-ManterCompactados` os `.7z` guardados são reaproveitados |
+| Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados e nenhum CSV parcial (`.tmp`) é mantido. O manifesto e o mapeamento já registraram cada arquivo concluído. Código de saída `2` |
 | Colunas novas no final do CSV | O MTE publicou uma coluna fora do dicionário. Ela foi preservada; veja `mapeamento_cabecalhos_MG.csv` |
 
 ---
