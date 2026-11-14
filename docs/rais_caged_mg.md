@@ -98,7 +98,7 @@ A ajuda completa fica no próprio script: `Get-Help .\pipeline_rais_caged.ps1 -F
 # Outra UF (o filtro e o arquivo regional da RAIS são escolhidos sozinhos)
 .\pipeline_rais_caged.ps1 -UF SP -Saida D:\MTE_SP
 
-# Reprocessar tudo, reaproveitando os .7z já baixados
+# Reprocessar tudo, reaproveitando os .7z já baixados (conexão direta; pelo proxy eles são baixados de novo)
 .\pipeline_rais_caged.ps1 -Reprocessar -ManterCompactados
 
 # Execução não interativa (Agendador de Tarefas / CMD): -Bases como texto separado por vírgula
@@ -122,15 +122,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | `-ManterValoresBrutos` | desligado | Não normaliza valores: só filtra, converte o encoding e reescreve o CSV |
 | `-CompactarSaida` | desligado | Grava `.csv.gz` (8 a 10 vezes menor) |
 | `-SemBOM` | desligado | UTF-8 sem BOM. O padrão é com BOM, para o Excel reconhecer os acentos |
-| `-Consolidar` | desligado | No final, gera um arquivo único por grupo em `<Saida>\CONSOLIDADO`, com todos os períodos OK do manifesto. Se algum período tiver sido gerado com outra configuração (decimal, delimitador, cabeçalho, valores brutos) ou estiver sem o arquivo, o consolidado anterior é mantido e o grupo fica em erro até a base ficar homogênea |
+| `-Consolidar` | desligado | No final, gera um arquivo único por grupo em `<Saida>\CONSOLIDADO`, com todos os períodos OK do manifesto. Se algum período tiver sido gerado com outra configuração (decimal, delimitador, cabeçalho, valores brutos ou versão do layout de saída, após atualizar o script) ou estiver sem o arquivo, o consolidado anterior é mantido e o grupo fica em erro até a base ficar homogênea. A mensagem do log diz o que fazer; em geral, basta rodar uma vez com o período completo (`-AnoInicial 2020`) |
 | `-Paralelismo` | `3` | Arquivos processados ao mesmo tempo, de 1 a 8. O FTP do MTE costuma aceitar até 4 conexões |
 | `-Reprocessar` | desligado | Ignora o manifesto e reprocessa tudo |
 | `-ManterCompactados` | desligado | Mantém os `.7z` em `<Saida>\_downloads` |
 | `-Caminho7Zip` | automático | Caminho do `7z.exe` (pode ser relativo à pasta atual) |
 | `-Baixar7Zip` | desligado | Se não achar o 7-Zip, baixa o `7zr.exe` oficial |
 | `-Motor` | `Auto` | `Auto` usa C# se possível e PowerShell como contingência. Também aceita `CSharp` ou `PowerShell` |
-| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: um download interrompido recomeça do zero, o download não é conferido pelo tamanho e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos). Alternar entre conexão direta e proxy na mesma pasta não marca nada como republicado; só os arquivos processados apenas pelo proxy são reprocessados uma vez, na primeira execução com conexão direta (o manifesto não tinha tamanho e data para comparar) |
-| `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados |
+| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: um download interrompido recomeça do zero, o download não é conferido pelo tamanho, com `-Reprocessar` os `.7z` guardados por `-ManterCompactados` são baixados de novo e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos). O total "para baixar" do log e a estimativa de espaço livre não contam esses arquivos (aparecem como "de tamanho desconhecido"). Alternar entre conexão direta e proxy na mesma pasta não marca nada como republicado; só os arquivos processados apenas pelo proxy são reprocessados uma vez, na primeira execução com conexão direta (o manifesto não tinha tamanho e data para comparar) |
+| `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados. Num espelho com listagem Unix, um arquivo publicado como link simbólico vem sem tamanho: a republicação só é detectada quando a data do link muda de dia, o download não é conferido pelo tamanho e, se interrompido, recomeça do zero (o log avisa; rode com `-Reprocessar` de tempos em tempos). O FTP do MTE não tem esse problema |
 | `-Tentativas` | `5` | Tentativas por listagem ou download, de 1 a 20 |
 | `-SomenteListar` | desligado | Simulação: lista o que seria baixado e processado |
 
@@ -139,7 +139,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | Código | Significado |
 | --- | --- |
 | `0` | Sucesso |
-| `1` | Terminou, mas algo ficou pendente: arquivo em erro (veja o manifesto), pasta do FTP que não pôde ser listada, consolidação recusada ou manifesto/mapeamento gravado só como `.pendente.csv` |
+| `1` | Terminou, mas algo ficou pendente: arquivo em erro (veja o manifesto), pasta do FTP que não pôde ser listada, consolidação recusada, manifesto ou mapeamento fora do arquivo principal (gravado só como `.pendente.csv`, ou nem nele) ou mapeamento ilegível |
 | `2` | Falha geral, outra execução usando a mesma pasta ou interrupção com Ctrl+C |
 
 ---
@@ -387,13 +387,15 @@ O `_controle\manifesto_MG.csv` tem uma linha por arquivo de origem. Os campos ma
 | `metrica_soma` | RAIS Vínculos: soma de `vinculo_ativo_3112`, o **estoque em 31/12**. RAIS Estab.: soma de `qtd_vinculos_ativos`. CAGED: soma de `saldo_movimentacao` |
 | `metrica_positivos` / `metrica_negativos` | no CAGED: admissões e desligamentos do arquivo |
 | `tamanho_remoto` / `data_remota` | detectam republicação pelo MTE, que leva a novo download |
-| `assinatura` | configuração que gerou a saída: versão do layout de saída (`L2` na versão 1.1.0 do script), UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado. Por isso, depois de atualizar o script para uma versão com outro layout, a primeira execução reprocessa tudo uma vez (e baixa de novo o que não estiver em `_downloads`; com `-ManterCompactados` os `.7z` ficam guardados) |
+| `assinatura` | configuração que gerou a saída: versão do layout de saída (`L2` na versão 1.1.0 do script), UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado. Por isso, depois de atualizar o script para uma versão com outro layout, cada arquivo é reprocessado uma vez, na primeira execução que o cobre (e baixado de novo se não estiver em `_downloads`; com `-ManterCompactados` os `.7z` ficam guardados). Períodos e bases fora da execução continuam no layout antigo até serem cobertos; até lá, o `-Consolidar` recusa o grupo |
 
 No final da execução, o log mostra um resumo por grupo e a **conferência da carga do Novo CAGED por ano do arquivo** (MOV + FOR − EXC). Ela confere a carga (deve bater com a soma de `saldo_movimentacao` dos CSVs), mas agrupa pelo ano do **nome** do arquivo. O "saldo com ajustes" do painel oficial soma FOR e subtrai EXC na `competencia_movimentacao` de cada linha; para comparar com o painel, use a consulta da [seção 11](#11-sql-server). A soma só do MOV por ano corresponde ao saldo "sem ajustes". O `metrica_soma` da RAIS Vínculos pode ser comparado com o estoque oficial de MG.
 
 O `dicionario_colunas.csv` traz, na coluna `observacao`, as mudanças de significado de códigos entre layouts e como somar o saldo do CAGED.
 
-**Arquivos de controle abertos no Excel** não derrubam a execução. Com o manifesto ou o mapeamento bloqueado, o script avisa, continua os downloads e tenta gravar o arquivo a cada arquivo concluído. Enquanto ele estiver bloqueado, o progresso vai para `<nome>.pendente.csv` (ex.: `manifesto_MG.pendente.csv`), e por isso uma interrupção não perde o que já foi processado. No fim, se o arquivo continuar bloqueado depois de 30 s de novas tentativas, fica o `.pendente.csv` (código de saída 1). A execução seguinte o incorpora sozinha, mesmo quando não há nada novo para processar. Um `.pendente.csv` mais antigo que o principal (ex.: o principal foi salvo depois pelo Excel) não é incorporado: ele fica guardado como `<nome>.pendente_ignorado_<data_hora>.csv` para conferência. Dicionário e DDL bloqueados só geram aviso; eles são regravados na próxima execução.
+**Arquivos de controle abertos no Excel** não derrubam a execução. Com o manifesto ou o mapeamento bloqueado, o script avisa, continua os downloads e tenta gravar o arquivo a cada arquivo concluído. Enquanto ele estiver bloqueado, o progresso vai para `<nome>.pendente.csv` (ex.: `manifesto_MG.pendente.csv`), e por isso uma interrupção não perde o que já foi processado. Não abra o `.pendente.csv` durante a execução: se ele também ficar bloqueado, o log avisa e, até um dos dois ser liberado, o progresso fica só na memória. No fim, se o arquivo continuar bloqueado depois de 30 s de novas tentativas, fica o `.pendente.csv` (código de saída 1). A execução seguinte o incorpora sozinha, mesmo quando não há nada novo para processar. Um `.pendente.csv` mais antigo que o principal (ex.: o principal foi salvo depois pelo Excel) não é incorporado: ele fica guardado como `<nome>.pendente_ignorado_<data_hora>.csv` para conferência. Dicionário e DDL bloqueados só geram aviso; eles são regravados na próxima execução.
+
+Para consultar o manifesto ou o mapeamento, abra-os no Excel e **feche sem salvar**. Salvo pelo Excel, o arquivo muda de formato: perde o UTF-8 (acentos de `mensagem` e de caminhos viram `�`), as datas passam a `dd/mm/aaaa` (o script aceita esse formato em `data_remota`) e, se o separador mudar, o arquivo deixa de ser lido. Salvo depois de um `.pendente.csv`, o principal fica mais novo e o pendente deixa de ser incorporado. Um arquivo de controle sem as colunas esperadas não é sobrescrito: o manifesto faz a execução parar com código `2`, e o mapeamento é deixado como está (código `1`). Corrija-o ou renomeie-o (sem o manifesto, tudo é baixado e processado de novo; sem o mapeamento, a linhagem dos arquivos já processados só volta com `-Reprocessar`).
 
 ---
 
@@ -526,13 +528,13 @@ Register-ScheduledTask -TaskName 'MTE - RAIS e Novo CAGED (MG)' -Action $acao -T
     -Description 'Atualiza incrementalmente RAIS e Novo CAGED filtrados para MG'
 ```
 
-O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada. Cada execução grava o próprio log (o nome leva data, hora e PID).
+O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada, manifesto ou mapeamento bloqueado ou ilegível), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada. Cada execução grava o próprio log (o nome leva data, hora e PID).
 
 ---
 
 ## 13. Volume, tempo e disco
 
-Os números são **ordens de grandeza para MG**. Os exatos de download aparecem no `-SomenteListar`.
+Os números são **ordens de grandeza para MG**. Os exatos de download aparecem no `-SomenteListar` (pelo proxy, o FTP não informa os tamanhos).
 
 | Grupo | Linhas de MG | CSV (sem compactar) |
 | --- | --- | --- |
@@ -561,13 +563,16 @@ Os números são **ordens de grandeza para MG**. Os exatos de download aparecem 
 | Arquivo de saída em uso | Feche o CSV no Excel ou no Power BI Desktop antes de rodar. Só aquele arquivo fica em erro; a próxima execução tenta de novo |
 | "Outra execução do script já está usando a pasta" | Há outra execução (agendada ou manual) na mesma `-Saida`. Espere ela terminar. A trava é liberada sozinha quando o processo antigo termina, mesmo depois de uma queda |
 | "Sem permissão para criar ou abrir a trava" | `_controle\execucao.lock` está como somente leitura ou pertence a outra conta (ex.: tarefa agendada com outro usuário). Ajuste as permissões ou apague o arquivo quando nenhuma execução estiver rodando |
-| "Manifesto não gravado" / `*.pendente.csv` | O manifesto ou o mapeamento estava aberto (ex.: Excel). Feche-o; a próxima execução incorpora o `.pendente.csv` sozinha |
-| `*.pendente_ignorado_<data_hora>.csv` | Um `.pendente.csv` era mais antigo que o arquivo principal (ex.: o principal foi salvo depois pelo Excel) e não foi incorporado. Confira e apague. Se ele tiver o que faltou, os arquivos ausentes do manifesto são reprocessados na próxima execução |
-| "Consolidação de ... falhou: período(s) gerado(s) com outra configuração" | Parte dos arquivos foi gerada com outro decimal, delimitador ou cabeçalho. Rode o período completo com a configuração desejada (ou `-Reprocessar`); o consolidado anterior foi mantido |
+| "Manifesto não gravado" / `*.pendente.csv` | O manifesto ou o mapeamento estava aberto (ex.: Excel). Feche-o **sem salvar**; a próxima execução incorpora o `.pendente.csv` sozinha. Não abra o `.pendente.csv` enquanto o script roda |
+| "Mapeamento de cabeçalhos desta execução NÃO foi gravado" | O mapeamento e o `.pendente.csv` dele ficaram bloqueados até o fim. A mensagem lista os arquivos sem linhagem: rode com `-Reprocessar` limitado a eles (`-Bases`, `-AnoInicial`, `-AnoFinal`) |
+| "... não tem a(s) coluna(s) ..." / "... não tem nenhuma das colunas esperadas ..." | O manifesto ou o mapeamento foi salvo por outro programa (ex.: Excel com outro separador) ou teve o cabeçalho apagado. O arquivo não foi sobrescrito: corrija-o (cabeçalho original, separador `;`) ou renomeie-o. Sem o manifesto, tudo é baixado e processado de novo; sem o mapeamento, a linhagem dos arquivos já processados só volta com `-Reprocessar` |
+| `*.pendente_ignorado_<data_hora>.csv` | Um `.pendente.csv` era mais antigo que o arquivo principal (ex.: o principal foi salvo depois pelo Excel) e não foi incorporado. Confira e apague. Os arquivos que só ele registrava já são reprocessados na mesma execução (os de fora da faixa dela, na primeira que os cobrir); a linhagem que só estiver nele (mapeamento) não volta sozinha: copie as linhas para o mapeamento ou use `-Reprocessar` nesses períodos |
+| "Consolidação de ... falhou: período(s) gerado(s) com outra configuração" | Parte dos arquivos foi gerada com outro decimal, delimitador ou cabeçalho, ou por uma versão anterior do script (outro layout de saída). Rode uma vez o período completo (`-AnoInicial 2020`) com a configuração desejada; `-Reprocessar` com o mesmo período parcial não resolve. O consolidado anterior foi mantido |
+| "Consolidação de ... falhou: ... não está(ão) mais no FTP" | O arquivo daquele período saiu do FTP (retirado ou movido para `Legado`) e a saída antiga não pode ser regenerada. Com o script parado, apague a linha do período em `_controle\manifesto_MG.csv` (no Bloco de Notas) e o CSV correspondente; a consolidação seguinte sai sem ele |
 | "Pasta ignorada nesta execução" | Uma pasta de ano/mês do FTP não pôde ser listada. O restante foi processado (código 1); a pasta volta na próxima execução |
 | `REPUBLICADO_DURANTE_DOWNLOAD` | O arquivo cresceu no FTP durante a execução (republicação). Ele é baixado de novo na próxima |
-| Primeira execução depois de atualizar o script reprocessa tudo | A versão do layout de saída mudou (ex.: 1.0.0 → 1.1.0) e, com ela, a assinatura do manifesto. Acontece uma vez; com `-ManterCompactados` os `.7z` guardados são reaproveitados |
-| Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados e nenhum CSV parcial (`.tmp`) é mantido. O manifesto e o mapeamento já registraram cada arquivo concluído. Código de saída `2` |
+| Primeira execução depois de atualizar o script reprocessa tudo | A versão do layout de saída mudou (ex.: 1.0.0 → 1.1.0) e, com ela, a assinatura do manifesto. Cada arquivo é reprocessado uma vez, na primeira execução que o cobre; com `-ManterCompactados` os `.7z` guardados são reaproveitados. Com período parcial (ex.: `-AnoInicial 2024`), os anos de fora ficam no layout antigo e o `-Consolidar` recusa o grupo (código 1) até uma execução com o período completo |
+| Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados (os de tamanho desconhecido, pelo proxy ou de link simbólico, recomeçam do zero) e os CSVs parciais (`.tmp`) são apagados (um que sobrar sai na execução seguinte). O manifesto e o mapeamento já registraram cada arquivo concluído (salvo se o `.pendente.csv` também estava bloqueado: o log avisa). Código de saída `2` |
 | Colunas novas no final do CSV | O MTE publicou uma coluna fora do dicionário. Ela foi preservada; veja `mapeamento_cabecalhos_MG.csv` |
 
 ---

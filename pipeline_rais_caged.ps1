@@ -26,8 +26,8 @@
                        os VALORES são os publicados em cada ano (alguns códigos de "não se aplica"
                        mudaram no layout 2023+; veja a coluna observacao do dicionário);
                      - limpeza: trim; "{ñ class}", "****" e "n/d" viram vazio; números normalizados
-                       (zeros à esquerda, separador de milhar, separador decimal único); CEP com 8
-                       dígitos (o layout 2023+ publica o CEP como número, sem o zero à esquerda);
+                       (zeros à esquerda, separador de milhar, separador decimal único); CEP numérico
+                       de 7 dígitos ganha o zero à esquerda (o layout 2023+ publica o CEP como número);
                      - colunas derivadas: ano-base (RAIS) e código IBGE de 7 dígitos do município.
     5. CARGA       - CSV UTF-8 (BOM opcional), um arquivo por arquivo de origem, manifesto de controle
                      com contagens e métricas de conferência, dicionário de colunas, mapeamento de
@@ -66,7 +66,8 @@
     Ponto (padrão; ideal para SQL Server/Python/Power Query com cultura en-US) ou Virgula (Excel pt-BR).
 
 .PARAMETER ManterValoresBrutos
-    Não normaliza valores (só filtra, converte encoding e reescreve o CSV). Desliga trim, nulos e números.
+    Não normaliza valores (só filtra, converte encoding e reescreve o CSV). Desliga trim, nulos, números
+    e o ajuste do CEP.
 
 .PARAMETER CompactarSaida
     Grava .csv.gz em vez de .csv (8-10x menor; o Power Query lê com Binary.Decompress).
@@ -77,8 +78,10 @@
 .PARAMETER Consolidar
     Ao final, gera um CSV único por grupo (ex.: CAGEDMOV_MG_202001_202609.csv) em <Saida>\CONSOLIDADO,
     com TODOS os períodos OK do manifesto. Se algum período tiver sido gerado com outra configuração
-    (decimal, delimitador, cabeçalho, valores brutos) ou estiver sem o arquivo, o consolidado anterior
-    é mantido e o grupo fica em erro (código de saída 1) até a base ficar homogênea.
+    (decimal, delimitador, cabeçalho, valores brutos ou versão do layout de saída, após atualizar o
+    script) ou estiver sem o arquivo, o consolidado anterior é mantido e o grupo fica em erro (código
+    de saída 1) até a base ficar homogênea; a mensagem do log diz o que fazer (em geral, rodar uma vez
+    com o período completo, -AnoInicial 2020).
 
 .PARAMETER Paralelismo
     Arquivos processados ao mesmo tempo (download + ETL). Padrão 3; o FTP do MTE costuma aceitar até 4.
@@ -102,7 +105,8 @@
     Acessa o FTP pelo proxy do sistema (por padrão a conexão FTP é direta). Só tem efeito no Windows
     PowerShell 5.1 (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy o FTP não informa tamanho
     nem data dos arquivos: um download interrompido recomeça do zero, o download não é conferido pelo
-    tamanho e republicações do MTE NÃO são detectadas (rode com -Reprocessar de tempos em tempos).
+    tamanho, com -Reprocessar os .7z guardados são baixados de novo e republicações do MTE NÃO são
+    detectadas (rode com -Reprocessar de tempos em tempos).
 
 .PARAMETER FtpBase
     Raiz dos microdados no FTP. Padrão: ftp://ftp.mtps.gov.br/pdet/microdados
@@ -133,16 +137,21 @@
     Requisitos .. PowerShell 5.1+ (.NET Framework 4.5+) ou PowerShell 7+; 7-Zip (ou -Baixar7Zip);
                   saída liberada para ftp.mtps.gov.br (porta 21 + portas passivas); modo FullLanguage.
     Encoding .... Este arquivo é UTF-8 COM BOM (obrigatório para o Windows PowerShell 5.1 ler os acentos).
-    Códigos de saída: 0 = sucesso; 1 = terminou com arquivos em erro (download/ETL, pasta do FTP que
-                      não pôde ser listada, consolidação, ou manifesto/mapeamento gravado só como
-                      .pendente.csv); 2 = falha geral, outra execução usando a mesma pasta ou
+    Códigos de saída: 0 = sucesso; 1 = terminou com algo pendente: arquivos em erro (download/ETL),
+                      pasta do FTP que não pôde ser listada, consolidação recusada, manifesto ou
+                      mapeamento fora do arquivo principal (só no .pendente.csv ou nem nele) ou
+                      mapeamento ilegível; 2 = falha geral, outra execução usando a mesma pasta ou
                       interrupção (Ctrl+C).
     Arquivos de controle abertos no Excel (manifesto, mapeamento) não derrubam a execução: o script
     avisa e, enquanto o arquivo estiver bloqueado, grava o progresso em <nome>.pendente.csv a cada
-    arquivo concluído. No fim tenta de novo por 30 s; se continuar bloqueado, fica o .pendente.csv
-    (código 1), incorporado sozinho na execução seguinte.
-    Atualização do script: quando a versão do layout de saída muda (1.1.0 = layout 2), a primeira
-    execução reprocessa todos os arquivos (e baixa de novo os que não estiverem em _downloads).
+    arquivo concluído (não abra o .pendente.csv durante a execução). No fim tenta de novo por 30 s;
+    se continuar bloqueado, fica o .pendente.csv (código 1), incorporado sozinho na execução seguinte.
+    Feche esses arquivos SEM salvar: salvos pelo Excel, mudam de formato (encoding, separador) e
+    ficam mais novos que o .pendente.csv, que deixa de ser incorporado.
+    Atualização do script: quando a versão do layout de saída muda (1.1.0 = layout 2), cada arquivo é
+    reprocessado (e baixado de novo, se não estiver em _downloads) na primeira execução que o cobre.
+    Períodos e bases fora dessa execução ficam no layout antigo e, até lá, o -Consolidar recusa o
+    grupo (código 1): rode uma vez com o período completo (-AnoInicial 2020).
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -2166,8 +2175,10 @@ function Invoke-ProcessarItem {
             if (Test-Path -LiteralPath $Item.CaminhoLocal) {
                 $tamLocal = (Get-Item -LiteralPath $Item.CaminhoLocal).Length
                 # Tamanho remoto desconhecido (modo proxy, link simbólico): o arquivo guardado só é reaproveitado
-                # sem -Reprocessar e se o FTP não indicar republicação (data mudou).
-                if ($tamLocal -eq $Item.Tamanho -or ($Item.Tamanho -le 0 -and @('Reprocessamento forçado', 'Republicado no FTP') -notcontains $Item.Situacao)) {
+                # sem -Reprocessar e se o FTP não indicar republicação (data mudou). Item novo com data na listagem
+                # (link): não há data anterior para conferir o arquivo guardado (ex.: Ctrl+C no ETL), baixa de novo.
+                $semConferir = (@('Reprocessamento forçado', 'Republicado no FTP') -contains $Item.Situacao) -or ($Item.Situacao -eq 'Novo' -and [string]$Item.DataRemota)
+                if ($tamLocal -eq $Item.Tamanho -or ($Item.Tamanho -le 0 -and -not $semConferir)) {
                     $baixar = $false
                     Write-LogFila $Fila 'INFO' $id ('Reaproveitando arquivo já baixado ({0}).' -f (Format-BytesLocal $tamLocal))
                 }
@@ -2452,13 +2463,53 @@ function Get-FontesControle {
     return $fontes.ToArray()
 }
 
+function Assert-ColunasControle {
+    <#
+        Arquivo de controle alterado fora do script (salvo pelo Excel com outro separador, cabeçalho apagado ou
+        movido): sem as colunas esperadas nada seria lido e a gravação seguinte apagaria o histórico. Lança erro.
+    #>
+    param([object[]]$Linhas, [string[]]$Colunas, [string]$Fonte, [string]$Consequencia)
+    if ($Linhas.Count -eq 0) { return }
+    $faltam = @($Colunas | Where-Object { $null -eq $Linhas[0].PSObject.Properties[$_] })
+    if ($faltam.Count -gt 0) {
+        $quais = 'a(s) coluna(s) ' + ($faltam -join ', ')
+        if ($faltam.Count -eq $Colunas.Count) { $quais = 'nenhuma das colunas esperadas (id, grupo, periodo...)' }
+        throw ('{0} não tem {1} separada(s) por ";" (foi salvo por outro programa?). Corrija-o ou renomeie-o; {2}' -f $Fonte, $quais, $Consequencia)
+    }
+}
+
+function ConvertTo-DataRemotaNormal {
+    <#
+        data_remota no formato do script (yyyy-MM-dd HH:mm, ou yyyy-MM-dd na listagem Unix). Aceita também o
+        formato que o Excel pt-BR grava ao salvar o manifesto (dd/MM/yyyy HH:mm): sem isso, um manifesto salvo
+        pelo Excel faria todos os arquivos parecerem republicados (e serem baixados de novo).
+    #>
+    param([string]$Texto)
+    $t = ([string]$Texto).Trim()
+    if (-not $t) { return '' }
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $estilo = [System.Globalization.DateTimeStyles]::None
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParseExact($t, [string[]]@('yyyy-MM-dd HH:mm', 'yyyy-MM-dd HH:mm:ss', 'dd/MM/yyyy HH:mm', 'dd/MM/yyyy HH:mm:ss', 'd/M/yyyy H:mm', 'd/M/yyyy H:mm:ss'), $inv, $estilo, [ref]$dt)) {
+        return $dt.ToString('yyyy-MM-dd HH:mm', $inv)
+    }
+    if ([datetime]::TryParseExact($t, [string[]]@('yyyy-MM-dd', 'dd/MM/yyyy', 'd/M/yyyy'), $inv, $estilo, [ref]$dt)) {
+        return $dt.ToString('yyyy-MM-dd', $inv)
+    }
+    return $t
+}
+
 function Import-Manifesto {
     param([string]$Caminho, [bool]$SomenteLeitura = $false)
     $m = @{}
     $fontes = @(Get-FontesControle -Caminho $Caminho -SomenteLeitura $SomenteLeitura)
     foreach ($fonte in $fontes) {
-        foreach ($l in @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)) {
-            if ($l.PSObject.Properties['id'] -and $l.id) { $m[$l.id] = $l }
+        $linhasFonte = @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)
+        Assert-ColunasControle -Linhas $linhasFonte -Colunas $Script:ColunasManifesto -Fonte $fonte -Consequencia 'sem o manifesto, todos os arquivos são baixados e processados de novo.'
+        foreach ($l in $linhasFonte) {
+            if (-not $l.id) { continue }
+            $l.data_remota = ConvertTo-DataRemotaNormal $l.data_remota
+            $m[$l.id] = $l
         }
     }
     # Um pendente incorporado precisa ir para o manifesto principal assim que possível.
@@ -2495,12 +2546,15 @@ function Import-Mapeamento {
         concluído, como o manifesto (uma interrupção não perde a linhagem do que já foi processado).
     #>
     param([string]$Caminho, [bool]$SomenteLeitura = $false)
-    $mapa = @{ Caminho = $Caminho; Linhas = @{}; Alterado = $false; Bloqueado = $false }
+    # Onde = destino da última gravação (Principal | Pendente | Nenhum); IdsExecucao = arquivos desta execução.
+    $mapa = @{ Caminho = $Caminho; Linhas = @{}; Alterado = $false; Onde = 'Principal'; IdsExecucao = (New-Object System.Collections.Generic.List[string]) }
     $fontes = @(Get-FontesControle -Caminho $Caminho -SomenteLeitura $SomenteLeitura)
     foreach ($fonte in $fontes) {
         $daFonte = @{}
-        foreach ($l in @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)) {
-            if ($null -eq $l.PSObject.Properties['id'] -or -not $l.id) { continue }
+        $linhasFonte = @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)
+        Assert-ColunasControle -Linhas $linhasFonte -Colunas $Script:ColunasMapeamento -Fonte $fonte -Consequencia 'sem ele, a linhagem dos arquivos já processados só volta com -Reprocessar.'
+        foreach ($l in $linhasFonte) {
+            if (-not $l.id) { continue }
             if (-not $daFonte.ContainsKey($l.id)) { $daFonte[$l.id] = New-Object System.Collections.Generic.List[string] }
             $daFonte[$l.id].Add((ConvertTo-LinhaCsvSaida -Valores @($l.id, $l.grupo, $l.periodo, $l.posicao_origem, $l.cabecalho_origem, $l.coluna_saida, $l.tipo) -Delimitador ';'))
         }
@@ -2523,6 +2577,7 @@ function Add-MapeamentoItem {
     }
     $Mapa.Linhas[$Item.Id] = $linhas.ToArray()
     $Mapa.Alterado = $true
+    if ($null -ne $Mapa.IdsExecucao -and -not $Mapa.IdsExecucao.Contains([string]$Item.Id)) { $Mapa.IdsExecucao.Add([string]$Item.Id) }
     return $true
 }
 
@@ -2568,44 +2623,53 @@ function Save-ControleSeguro {
 }
 
 function Write-AvisoControleBloqueado {
-    <# Primeiro aviso de manifesto/mapeamento bloqueado durante a execução. #>
+    <# Aviso de manifesto/mapeamento bloqueado durante a execução (a cada mudança de destino da gravação). #>
     param([string]$Rotulo, [string]$Caminho, $Gravacao)
     $nome = Split-Path -Leaf $Caminho
     $nomePendente = Split-Path -Leaf (Get-CaminhoPendente $Caminho)
     if ($Gravacao.Onde -eq 'Pendente') {
-        Write-Log ('{0} não gravado em {1} ({2}). Se ele estiver aberto em outro programa (ex.: Excel), feche-o: nova tentativa a cada arquivo concluído; até lá o progresso fica em {3}.' -f $Rotulo, $nome, $Gravacao.Motivo, $nomePendente) 'AVISO'
+        Write-Log ('{0} não gravado em {1} ({2}). Se ele estiver aberto em outro programa (ex.: Excel), feche-o sem salvar: nova tentativa a cada arquivo concluído; até lá o progresso fica em {3} (não abra esse arquivo durante a execução).' -f $Rotulo, $nome, $Gravacao.Motivo, $nomePendente) 'AVISO'
     }
     else {
-        Write-Log ('{0} não gravado em {1} nem em {2} ({3}). Feche os dois se estiverem abertos (ex.: Excel): nova tentativa a cada arquivo concluído.' -f $Rotulo, $nome, $nomePendente, $Gravacao.Motivo) 'AVISO'
+        Write-Log ('{0} não gravado em {1} nem em {2} ({3}). Feche os dois sem salvar se estiverem abertos (ex.: Excel): nova tentativa a cada arquivo concluído; até lá o progresso fica só na memória e uma interrupção o perde.' -f $Rotulo, $nome, $nomePendente, $Gravacao.Motivo) 'AVISO'
     }
 }
 
 function Complete-ControlePendente {
     <#
         Fim da execução com o manifesto/mapeamento ainda fora do arquivo principal (bloqueado, ex.: Excel):
-        mais algumas tentativas e, por último, grava <nome>.pendente.csv, incorporado sozinho na próxima
-        execução. Nesse caso o código de saída passa a 1. $true = principal gravado.
+        mais algumas tentativas e, se o principal continuar bloqueado, fica o <nome>.pendente.csv, incorporado
+        sozinho na próxima execução. Cada tentativa também atualiza o .pendente.csv, para uma interrupção
+        durante a espera não perder o progresso. Nesse caso o código de saída passa a 1. $true = principal gravado.
     #>
     param([ValidateSet('Manifesto', 'Mapeamento')][string]$Tipo, $Dados, [string]$Caminho)
     $rotulo = 'Manifesto'
     if ($Tipo -eq 'Mapeamento') { $rotulo = 'Mapeamento de cabeçalhos' }
-    $g = Save-ControleSeguro -Tipo $Tipo -Dados $Dados -Caminho $Caminho -SoPrincipal $true
+    $g = Save-ControleSeguro -Tipo $Tipo -Dados $Dados -Caminho $Caminho
     for ($k = 1; $k -le 6 -and $g.Onde -ne 'Principal'; $k++) {
-        Write-Log ('{0} continua bloqueado ({1}); feche-o (ex.: Excel). Nova tentativa em 5 s ({2}/6).' -f $Caminho, $g.Motivo, $k) 'AVISO'
+        Write-Log ('{0} continua bloqueado ({1}); feche-o sem salvar (ex.: Excel). Nova tentativa em 5 s ({2}/6).' -f $Caminho, $g.Motivo, $k) 'AVISO'
         Start-Sleep -Seconds 5
-        $g = Save-ControleSeguro -Tipo $Tipo -Dados $Dados -Caminho $Caminho -SoPrincipal $true
+        $g = Save-ControleSeguro -Tipo $Tipo -Dados $Dados -Caminho $Caminho
         if ($g.Onde -eq 'Principal') { Write-Log ('{0} gravado.' -f $rotulo) 'OK' }
     }
     if ($g.Onde -eq 'Principal') { return $true }
     $pendente = Get-CaminhoPendente $Caminho
-    try {
-        if ($Tipo -eq 'Manifesto') { Save-Manifesto -Manifesto $Dados -Caminho $pendente } else { Save-Mapeamento -Mapa $Dados -Caminho $pendente }
-        Write-Log ('{0} desta execução gravado em {1}. Ele será incorporado na próxima execução; feche {2} antes.' -f $rotulo, $pendente, (Split-Path -Leaf $Caminho)) 'ERRO'
+    if ($g.Onde -eq 'Pendente') {
+        Write-Log ('{0} desta execução gravado em {1}. Ele será incorporado na próxima execução; feche {2} sem salvar antes.' -f $rotulo, $pendente, (Split-Path -Leaf $Caminho)) 'ERRO'
     }
-    catch {
+    else {
         $consequencia = 'o que não foi registrado será reprocessado na próxima execução'
-        if ($Tipo -eq 'Mapeamento') { $consequencia = 'a linhagem dos arquivos desta execução fica só no log; rode com -Reprocessar se precisar dela' }
-        Write-Log ('{0} desta execução NÃO foi gravado: {1} e {2} estão bloqueados ({3}); {4}.' -f $rotulo, (Split-Path -Leaf $Caminho), (Split-Path -Leaf $pendente), $_.Exception.Message, $consequencia) 'ERRO'
+        if ($Tipo -eq 'Mapeamento') {
+            $ids = @()
+            if ($null -ne $Dados.IdsExecucao) { $ids = @($Dados.IdsExecucao) }
+            if ($ids.Count -gt 0) {
+                $lista = (@($ids | Select-Object -First 10) -join ', ')
+                if ($ids.Count -gt 10) { $lista = '{0} e mais {1}' -f $lista, ($ids.Count - 10) }
+                $consequencia = 'a linhagem destes arquivos não foi registrada: {0}. Para refazê-la, rode com -Reprocessar limitado a eles (-Bases, -AnoInicial, -AnoFinal)' -f $lista
+            }
+            else { $consequencia = 'nesta execução nenhum arquivo novo entrou no mapeamento; o .pendente.csv já existente continua valendo' }
+        }
+        Write-Log ('{0} desta execução NÃO foi gravado: {1} e {2} estão bloqueados ({3}); {4}.' -f $rotulo, (Split-Path -Leaf $Caminho), (Split-Path -Leaf $pendente), $g.Motivo, $consequencia) 'ERRO'
     }
     $Script:ErroControle = $true
     return $false
@@ -2647,11 +2711,13 @@ function Get-SituacaoItem {
     if ($Cfg.Reprocessar) { return 'Reprocessamento forçado' }
     if (-not $Manifesto.ContainsKey($Item.Id)) { return 'Novo' }
     $m = $Manifesto[$Item.Id]
-    if (@('OK', 'SEM_DADOS') -notcontains [string]$m.status) { return ('Pendente (status anterior: {0})' -f $m.status) }
     # Listagem sem tamanho nem data (modo proxy): não há com o que comparar. Sem isso, alternar entre conexão
     # direta e proxy marcaria a base inteira como republicada.
     $semInfo = ([long]$Item.Tamanho -le 0 -and -not [string]$Item.DataRemota)
+    # A republicação vem antes do status anterior: um item em ERRO cujo arquivo mudou no FTP não pode
+    # reaproveitar o .7z antigo que o erro deixou em _downloads.
     if (-not $semInfo -and ([string]$m.tamanho_remoto -ne [string]$Item.Tamanho -or [string]$m.data_remota -ne [string]$Item.DataRemota)) { return 'Republicado no FTP' }
+    if (@('OK', 'SEM_DADOS') -notcontains [string]$m.status) { return ('Pendente (status anterior: {0})' -f $m.status) }
     if ([string]$m.assinatura -ne $Cfg.Assinatura) { return 'Configuração alterada' }
     if ([string]$m.status -eq 'OK' -and -not (Test-Path -LiteralPath $Item.CaminhoSaida)) { return 'Saída ausente' }
     return $null
@@ -2781,7 +2847,7 @@ function Invoke-Execucao {
     $total = $Itens.Count
     $ultimoProgresso = [DateTime]::MinValue
     $atividade = 'RAIS/CAGED - UF {0}' -f $Cfg.UF
-    $manifestoBloqueado = $false
+    $ondeManifesto = 'Principal'   # destino da última gravação do manifesto: Principal | Pendente | Nenhum
     try {
         foreach ($item in $Itens) {
             $ps = [System.Management.Automation.PowerShell]::Create()
@@ -2814,34 +2880,33 @@ function Invoke-Execucao {
                 if ($null -eq $r) {
                     $r = [pscustomobject]@{ IdItem = $t.Item.Id; id = $t.Item.Id; status = 'ERRO'; mensagem = 'O worker não devolveu resultado.'; Avisos = @(); Mapeamento = @() }
                 }
-                Update-ManifestoItem -Item $t.Item -Resultado $r -Manifesto $Manifesto -Cfg $Cfg
-                $Script:ManifestoAlterado = $true
-                # Manifesto bloqueado (ex.: aberto no Excel) não cancela os downloads em andamento: avisa uma vez,
-                # tenta de novo a cada arquivo concluído e, enquanto isso, guarda o progresso no .pendente.csv
-                # (uma interrupção, janela fechada ou queda não perde o que já foi processado).
-                $g = Save-ControleSeguro -Tipo 'Manifesto' -Dados $Manifesto -Caminho $CaminhoManifesto
-                if ($g.Onde -eq 'Principal') {
-                    if ($manifestoBloqueado) { Write-Log 'Manifesto gravado novamente.' 'OK' }
-                    $manifestoBloqueado = $false
-                    $Script:ManifestoAlterado = $false
-                }
-                elseif (-not $manifestoBloqueado) {
-                    $manifestoBloqueado = $true
-                    Write-AvisoControleBloqueado -Rotulo 'Manifesto' -Caminho $CaminhoManifesto -Gravacao $g
-                }
-                # Mapeamento de cabeçalhos: mesma regra, a cada arquivo concluído.
+                # Arquivo de controle bloqueado (ex.: aberto no Excel) não cancela os downloads em andamento: avisa a
+                # cada mudança de destino, tenta de novo a cada arquivo concluído e, enquanto isso, guarda o progresso
+                # no .pendente.csv (uma interrupção, janela fechada ou queda não perde o que já foi processado).
+                # O mapeamento de cabeçalhos vai primeiro: uma interrupção entre as duas gravações deixa, no máximo,
+                # a linhagem de um arquivo que o manifesto ainda não registrou (ele é reprocessado e as linhas, trocadas).
                 if ($null -ne $Mapa -and (Add-MapeamentoItem -Mapa $Mapa -Item $t.Item -Resultado $r)) {
                     $gm = Save-ControleSeguro -Tipo 'Mapeamento' -Dados $Mapa -Caminho $Mapa.Caminho
                     if ($gm.Onde -eq 'Principal') {
-                        if ($Mapa.Bloqueado) { Write-Log 'Mapeamento de cabeçalhos gravado novamente.' 'OK' }
-                        $Mapa.Bloqueado = $false
+                        if ($Mapa.Onde -ne 'Principal') { Write-Log 'Mapeamento de cabeçalhos gravado novamente.' 'OK' }
                         $Mapa.Alterado = $false
                     }
-                    elseif (-not $Mapa.Bloqueado) {
-                        $Mapa.Bloqueado = $true
+                    elseif ($gm.Onde -ne $Mapa.Onde) {
                         Write-AvisoControleBloqueado -Rotulo 'Mapeamento de cabeçalhos' -Caminho $Mapa.Caminho -Gravacao $gm
                     }
+                    $Mapa.Onde = $gm.Onde
                 }
+                Update-ManifestoItem -Item $t.Item -Resultado $r -Manifesto $Manifesto -Cfg $Cfg
+                $Script:ManifestoAlterado = $true
+                $g = Save-ControleSeguro -Tipo 'Manifesto' -Dados $Manifesto -Caminho $CaminhoManifesto
+                if ($g.Onde -eq 'Principal') {
+                    if ($ondeManifesto -ne 'Principal') { Write-Log 'Manifesto gravado novamente.' 'OK' }
+                    $Script:ManifestoAlterado = $false
+                }
+                elseif ($g.Onde -ne $ondeManifesto) {
+                    Write-AvisoControleBloqueado -Rotulo 'Manifesto' -Caminho $CaminhoManifesto -Gravacao $g
+                }
+                $ondeManifesto = $g.Onde
                 $resultados.Add([pscustomobject]@{ Item = $t.Item; Resultado = $r })
                 $estado.Remove($t.Item.Id)
                 foreach ($a in @($r.Avisos)) { Write-Log -Mensagem $a -Nivel 'AVISO' -Id $t.Item.Id }
@@ -2897,7 +2962,12 @@ function Invoke-Execucao {
                 if ($abertos -eq 0) { break }
                 [System.Threading.Thread]::Sleep(200)
             }
-            Write-Log ('Execução interrompida: {0} arquivo(s) cancelado(s). Downloads parciais serão retomados na próxima execução.' -f $pendentes.Count) 'AVISO'
+            # Só construções da linguagem aqui (o pipeline está parando). Sem tamanho remoto não há retomada.
+            $semRetomada = 0
+            foreach ($t in $pendentes) { if ([long]$t.Item.Tamanho -le 0) { $semRetomada++ } }
+            $retomada = 'Downloads parciais serão retomados na próxima execução.'
+            if ($semRetomada -gt 0) { $retomada = 'Downloads parciais de tamanho conhecido serão retomados na próxima execução; os de tamanho desconhecido (proxy, link simbólico) recomeçam do zero.' }
+            Write-Log ('Execução interrompida: {0} arquivo(s) cancelado(s). {1}' -f $pendentes.Count, $retomada) 'AVISO'
             try { [void]$pool.BeginClose($null, $null) } catch { }
         }
         else {
@@ -2973,21 +3043,46 @@ function Merge-Consolidado {
         Concatena as saídas de um grupo num único CSV (cabeçalho uma vez), em streaming de bytes. Só consolida
         uma base homogênea e completa; caso contrário mantém o consolidado anterior e lança erro (exit 1).
     #>
-    param([string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg)
+    param([string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg, [hashtable]$IdsListados)
     $linhasOk = @($Linhas | Where-Object { $_.status -eq 'OK' } | Sort-Object periodo, regiao)
     if ($linhasOk.Count -eq 0) { return }
-    # Períodos gerados com outra configuração (ex.: decimal com vírgula) não podem ser misturados.
+    $manifestoUF = '_controle\manifesto_{0}.csv' -f $Cfg.UF
+    # Linhas do período desta execução que a listagem (completa) do FTP não trouxe: o arquivo saiu do FTP (retirado
+    # ou movido para Legado) e a saída não pode ser regenerada nem com -AnoInicial nem com -Reprocessar.
+    $semOrigem = @{}
+    if ($null -ne $IdsListados -and -not $Script:ListagemIncompleta) {
+        foreach ($l in $linhasOk) {
+            if ([string]$l.periodo -match '^(\d{4})') {
+                $ano = [int]$Matches[1]
+                if ($ano -ge $Cfg.AnoInicial -and $ano -le $Cfg.AnoFinal -and -not $IdsListados.ContainsKey([string]$l.id)) { $semOrigem[[string]$l.id] = $true }
+            }
+        }
+    }
+    # Períodos gerados com outra configuração (ex.: decimal com vírgula) ou por uma versão anterior do script
+    # (outro layout de saída) não podem ser misturados.
     $fmtAtual = Get-AssinaturaConteudo $Cfg.Assinatura
-    $outraCfg = @($linhasOk | Where-Object { (Get-AssinaturaConteudo ([string]$_.assinatura)) -ne $fmtAtual } | ForEach-Object { ('{0} {1}' -f $_.periodo, $_.regiao).Trim() })
+    $linhasOutra = @($linhasOk | Where-Object { (Get-AssinaturaConteudo ([string]$_.assinatura)) -ne $fmtAtual })
+    $foraFtp = @($linhasOutra | Where-Object { $semOrigem.ContainsKey([string]$_.id) } | ForEach-Object { ('{0} {1}' -f $_.periodo, $_.regiao).Trim() })
+    if ($foraFtp.Count -gt 0) {
+        throw ('{0} período(s) gerado(s) com outra configuração não está(ão) mais no FTP e não pode(m) ser regenerado(s) ({1}). Para consolidar sem ele(s), com o script parado apague a(s) linha(s) desse(s) período(s) em {2} e o CSV correspondente; consolidado anterior mantido.' -f $foraFtp.Count, ($foraFtp -join ', '), $manifestoUF)
+    }
+    $outraCfg = @($linhasOutra | ForEach-Object { ('{0} {1}' -f $_.periodo, $_.regiao).Trim() })
     if ($outraCfg.Count -gt 0) {
-        throw ('{0} período(s) gerado(s) com outra configuração ({1}). Rode com o período completo (-AnoInicial {2}) ou com -Reprocessar antes de consolidar; consolidado anterior mantido.' -f $outraCfg.Count, ($outraCfg -join ', '), ([string]$linhasOk[0].periodo).Substring(0, 4))
+        # Os períodos listados nesta execução já foram reprocessados ("Configuração alterada"); sobram os de fora
+        # da faixa, que só uma execução com o período completo alcança (-Reprocessar com a mesma faixa não basta).
+        throw ('{0} período(s) gerado(s) com outra configuração ou por uma versão anterior do script ({1}). Rode uma vez com o período completo (-AnoInicial {2}) antes de consolidar; consolidado anterior mantido.' -f $outraCfg.Count, ($outraCfg -join ', '), ([string]$linhasOk[0].periodo).Substring(0, 4))
     }
     $arquivos = New-Object System.Collections.Generic.List[string]
     $ausentes = New-Object System.Collections.Generic.List[string]
+    $ausentesForaFtp = New-Object System.Collections.Generic.List[string]
     foreach ($l in $linhasOk) {
         $caminho = Resolve-ArquivoSaida -Linha $l -Cfg $Cfg
         if ($caminho -and (Test-Path -LiteralPath $caminho)) { $arquivos.Add($caminho) }
+        elseif ($semOrigem.ContainsKey([string]$l.id)) { $ausentesForaFtp.Add((('{0} {1}' -f $l.periodo, $l.regiao).Trim())) }
         else { $ausentes.Add((('{0} {1}' -f $l.periodo, $l.regiao).Trim())) }
+    }
+    if ($ausentesForaFtp.Count -gt 0) {
+        throw ('saída ausente para {0}, que não está(ão) mais no FTP e não pode(m) ser regenerado(s). Para consolidar sem ele(s), com o script parado apague a(s) linha(s) desse(s) período(s) em {1}; consolidado anterior mantido.' -f ($ausentesForaFtp -join ', '), $manifestoUF)
     }
     if ($ausentes.Count -gt 0) {
         throw ('saída ausente para {0}: rode de novo cobrindo esse(s) período(s) para regenerá-la(s); consolidado anterior mantido.' -f ($ausentes -join ', '))
@@ -3306,7 +3401,8 @@ try {
     # Manifesto e descoberta.
     $caminhoManifesto = Join-Path $pastaControle ('manifesto_{0}.csv' -f $UF)
     $manifesto = Import-Manifesto -Caminho $caminhoManifesto -SomenteLeitura ([bool]$SomenteListar)
-    # Mapeamento de cabeçalhos: um arquivo ilegível não impede a carga (a linhagem desta execução fica no log).
+    # Mapeamento de cabeçalhos: um arquivo ilegível não impede a carga (a linhagem desta execução não é registrada
+    # e o arquivo é preservado; código 1).
     $mapa = $null
     $caminhoMapeamento = Join-Path $pastaControle ('mapeamento_cabecalhos_{0}.csv' -f $UF)
     try { $mapa = Import-Mapeamento -Caminho $caminhoMapeamento -SomenteLeitura ([bool]$SomenteListar) }
@@ -3323,7 +3419,7 @@ try {
     if ($Script:ManifestoAlterado -and -not $SomenteListar) {
         $gravacaoInicial = Save-ControleSeguro -Tipo 'Manifesto' -Dados $manifesto -Caminho $caminhoManifesto -SoPrincipal $true
         if ($gravacaoInicial.Onde -eq 'Principal') { $Script:ManifestoAlterado = $false }
-        else { Write-Log ('Manifesto não gravado ({0}). Se ele estiver aberto em outro programa (ex.: Excel), feche-o; o script tenta de novo durante a execução.' -f $gravacaoInicial.Motivo) 'AVISO' }
+        else { Write-Log ('Manifesto não gravado ({0}). Se ele estiver aberto em outro programa (ex.: Excel), feche-o sem salvar; o script tenta de novo durante a execução.' -f $gravacaoInicial.Motivo) 'AVISO' }
     }
     $extensao = '.csv'
     if ($cfg.Gzip) { $extensao = '.csv.gz' }
@@ -3331,8 +3427,12 @@ try {
         Write-Log '-UsarProxySistema não tem efeito no PowerShell 7+: o .NET atual não usa proxy em FTP (a conexão é direta).' 'AVISO'
     }
     $itens = @(Get-ItensRemotos -Cfg $cfg -Grupos $grupos)
-    if ($cfg.UsarProxy -and @($itens | Where-Object { $_.Tamanho -le 0 }).Count -gt 0) {
+    $semTamanho = @($itens | Where-Object { $_.Tamanho -le 0 }).Count
+    if ($cfg.UsarProxy -and $semTamanho -gt 0) {
         Write-Log 'Modo proxy: o FTP não informou tamanho/data. Republicações do MTE NÃO são detectadas e o download não é conferido pelo tamanho; rode com -Reprocessar de tempos em tempos.' 'AVISO'
+    }
+    elseif ($semTamanho -gt 0) {
+        Write-Log ('{0} arquivo(s) sem tamanho na listagem do FTP (link simbólico em servidor Unix): a republicação só é detectada quando a data do link muda de dia e o download não é conferido pelo tamanho; rode com -Reprocessar de tempos em tempos.' -f $semTamanho) 'AVISO'
     }
     foreach ($it in $itens) {
         $meta = $Script:MetaGrupos[$it.Grupo]
@@ -3346,8 +3446,11 @@ try {
     }
     $aProcessar = @($itens | Where-Object { $null -ne $_.Situacao } | Sort-Object -Property @{ Expression = { [long]$_.Tamanho }; Descending = $true })
     $bytesBaixar = [double]0
-    foreach ($it in $aProcessar) { if ($it.Tamanho -gt 0) { $bytesBaixar += $it.Tamanho } }
-    Write-Log ('Encontrados {0} arquivo(s) no FTP; {1} a processar ({2} para baixar); {3} já em dia.' -f $itens.Count, $aProcessar.Count, (Format-Bytes $bytesBaixar), ($itens.Count - $aProcessar.Count))
+    $baixarSemTamanho = 0
+    foreach ($it in $aProcessar) { if ($it.Tamanho -gt 0) { $bytesBaixar += $it.Tamanho } else { $baixarSemTamanho++ } }
+    $volume = '{0} para baixar' -f (Format-Bytes $bytesBaixar)
+    if ($baixarSemTamanho -gt 0) { $volume = '{0} + {1} arquivo(s) de tamanho desconhecido' -f $volume, $baixarSemTamanho }
+    Write-Log ('Encontrados {0} arquivo(s) no FTP; {1} a processar ({2}); {3} já em dia.' -f $itens.Count, $aProcessar.Count, $volume, ($itens.Count - $aProcessar.Count))
     foreach ($g in $grupos) {
         if (@($itens | Where-Object { $_.Grupo -eq $g }).Count -eq 0) { Write-Log ('Nenhum arquivo de {0} encontrado no período {1}-{2}.' -f $g, $AnoInicial, $AnoFinal) 'AVISO' }
     }
@@ -3405,8 +3508,11 @@ try {
                 Write-Log 'Consolidação ignorada: com -Cabecalho Original os layouts variam entre anos.' 'AVISO'
             }
             else {
+                # Ids encontrados no FTP nesta execução: separa os períodos que saíram do FTP dos que estão fora da faixa.
+                $idsListados = @{}
+                foreach ($it in $itens) { $idsListados[[string]$it.Id] = $true }
                 foreach ($g in $grupos) {
-                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg }
+                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg -IdsListados $idsListados }
                     catch { Write-Log ('Consolidação de {0} falhou: {1}' -f $g, $_.Exception.Message) 'ERRO'; $codigoSaida = 1 }
                 }
             }
