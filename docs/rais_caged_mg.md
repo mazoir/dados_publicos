@@ -1,0 +1,535 @@
+# RAIS + Novo CAGED (MTE/PDET) → CSV de MG com ETL em PowerShell
+
+Script: [`pipeline_rais_caged.ps1`](../pipeline_rais_caged.ps1), na raiz do repositório.
+
+Ele baixa os microdados oficiais da **RAIS** (vínculos e estabelecimentos) e do **Novo CAGED** (movimentações, declarações fora do prazo e exclusões), de **2020 em diante**, direto do FTP do PDET/MTE. O ETL roda dentro do próprio PowerShell. A saída é um CSV por arquivo de origem, **só com os registros da UF escolhida (padrão: MG)** e com cabeçalho legível. As execuções seguintes são incrementais.
+
+> **Sumário**
+> 1. [O que o script entrega](#1-o-que-o-script-entrega)
+> 2. [Requisitos](#2-requisitos)
+> 3. [Primeira execução](#3-primeira-execução-passo-a-passo)
+> 4. [Exemplos de uso](#4-exemplos-de-uso)
+> 5. [Parâmetros](#5-parâmetros)
+> 6. [Estrutura de saída](#6-estrutura-de-saída)
+> 7. [Colunas](#7-colunas)
+> 8. [Regras de tratamento (ETL)](#8-regras-de-tratamento-etl)
+> 9. [Conferência e qualidade](#9-conferência-e-qualidade)
+> 10. [Power BI (Power Query)](#10-power-bi-power-query)
+> 11. [SQL Server](#11-sql-server)
+> 12. [Agendamento](#12-agendamento-agendador-de-tarefas)
+> 13. [Volume, tempo e disco](#13-volume-tempo-e-disco)
+> 14. [Solução de problemas](#14-solução-de-problemas)
+> 15. [Cuidados analíticos](#15-cuidados-analíticos)
+
+---
+
+## 1. O que o script entrega
+
+| Grupo | Origem no FTP (`ftp://ftp.mtps.gov.br/pdet/microdados`) | Granularidade | Filtro da UF | Arquivo de saída |
+| --- | --- | --- | --- | --- |
+| `RAIS_VINC` | `RAIS/<ano>/RAIS_VINC_PUB_MG_ES_RJ.7z` (+ `RAIS_VINC_PUB_NI.7z`, quando existe) | 1 linha por vínculo no ano | município do **estabelecimento** começa com `31` | `RAIS\VINCULOS\RAIS_VINC_MG_<ano>.csv` (e `..._<ano>_NI.csv`) |
+| `RAIS_ESTAB` | `RAIS/<ano>/RAIS_ESTAB_PUB.7z` | 1 linha por estabelecimento | coluna `UF` = `31` | `RAIS\ESTABELECIMENTOS\RAIS_ESTAB_MG_<ano>.csv` |
+| `CAGED_MOV` | `NOVO CAGED/<ano>/<AAAAMM>/CAGEDMOV<AAAAMM>.7z` | 1 linha por movimentação | coluna `uf` = `31` | `CAGED\MOV\CAGEDMOV_MG_<AAAAMM>.csv` |
+| `CAGED_FOR` | `NOVO CAGED/<ano>/<AAAAMM>/CAGEDFOR<AAAAMM>.7z` | declarações fora do prazo | coluna `uf` = `31` | `CAGED\FOR\CAGEDFOR_MG_<AAAAMM>.csv` |
+| `CAGED_EXC` | `NOVO CAGED/<ano>/<AAAAMM>/CAGEDEXC<AAAAMM>.7z` | exclusões | coluna `uf` = `31` | `CAGED\EXC\CAGEDEXC_MG_<AAAAMM>.csv` |
+
+Como o pipeline funciona, em cinco etapas:
+
+1. **Descoberta.** Lista o FTP e encontra todos os arquivos do período. Anos e meses novos e republicações do MTE são detectados sozinhos. A pasta `Legado` do Novo CAGED é ignorada.
+2. **Download.** Roda em paralelo, retoma arquivos `.part` interrompidos e tenta de novo com espera crescente. O tamanho baixado é conferido com o do FTP e a integridade com o CRC do 7-Zip.
+3. **Extração em streaming.** O comando é `7z e -so`. O TXT descompactado, que passa de 5 GB por ano na RAIS de MG/ES/RJ, nunca é gravado em disco.
+4. **Transformação.** O motor padrão é C#, compilado em memória via `Add-Type`. O motor PowerShell puro serve de contingência e gera saída byte a byte idêntica. A etapa filtra a UF, unifica os layouts de todos os anos, limpa e normaliza os valores e cria as colunas derivadas.
+5. **Carga.** Grava os CSVs em UTF-8 e, em `_controle`, o manifesto com contagens e métricas, o dicionário de colunas, o mapeamento de cabeçalhos e a DDL para SQL Server. Se pedido, consolida tudo em um arquivo por grupo.
+
+---
+
+## 2. Requisitos
+
+| Item | Detalhe |
+| --- | --- |
+| PowerShell | **Windows PowerShell 5.1** (Windows 10/11, Server 2016+) com .NET Framework 4.5+, **ou PowerShell 7+** |
+| 7-Zip | `7z.exe` instalado (Program Files, registro ou PATH). Sem 7-Zip, use `-Caminho7Zip` ou `-Baixar7Zip`, que baixa o `7zr.exe` oficial de www.7-zip.org para `<Saida>\_ferramentas` |
+| Rede | Saída para `ftp.mtps.gov.br`, **porta 21 + portas passivas**. Redes corporativas costumam bloquear FTP; teste antes com `-SomenteListar` |
+| Modo de linguagem | `FullLanguage`. Sob AppLocker/WDAC em `ConstrainedLanguage` o script para com mensagem clara |
+| Encoding do arquivo | O `.ps1` é **UTF-8 com BOM** e deve continuar assim. Sem o BOM, o Windows PowerShell 5.1 lê os acentos errado. Se editar no Bloco de Notas, salve como "UTF-8 com BOM" |
+| Disco | Veja a [seção 13](#13-volume-tempo-e-disco). Com `-CompactarSaida`, a saída fica de 8 a 10 vezes menor |
+
+---
+
+## 3. Primeira execução (passo a passo)
+
+```powershell
+# 1) Baixe o script (ou clone o repositório)
+Invoke-WebRequest -UseBasicParsing -OutFile .\pipeline_rais_caged.ps1 `
+    -Uri 'https://raw.githubusercontent.com/mazoir/dados_publicos/main/pipeline_rais_caged.ps1'
+
+# 2) Desbloqueie o arquivo baixado da internet e libere a execução só nesta sessão
+Unblock-File .\pipeline_rais_caged.ps1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+# 3) Simulação: mostra o que existe no FTP e quanto será baixado, sem baixar nada
+.\pipeline_rais_caged.ps1 -SomenteListar
+
+# 4) Carga completa: RAIS + Novo CAGED, 2020 até hoje, MG
+.\pipeline_rais_caged.ps1
+
+# 5) Depois, rode quando quiser: só o que é novo ou republicado é processado
+.\pipeline_rais_caged.ps1
+```
+
+A ajuda completa fica no próprio script: `Get-Help .\pipeline_rais_caged.ps1 -Full`.
+
+---
+
+## 4. Exemplos de uso
+
+```powershell
+# Só o Novo CAGED (movimentações) desde 2024, com um CSV consolidado no final
+.\pipeline_rais_caged.ps1 -Saida D:\MTE -Bases CAGED_MOV -AnoInicial 2024 -Consolidar
+
+# RAIS completa (vínculos + estabelecimentos) de 2022 a 2024, saída compactada (.csv.gz)
+.\pipeline_rais_caged.ps1 -Bases RAIS -AnoInicial 2022 -AnoFinal 2024 -CompactarSaida
+
+# Para abrir no Excel pt-BR: vírgula decimal e rótulos descritivos no cabeçalho
+.\pipeline_rais_caged.ps1 -Bases CAGED -SeparadorDecimal Virgula -Cabecalho Descritivo
+
+# Outra UF (o filtro e o arquivo regional da RAIS são escolhidos sozinhos)
+.\pipeline_rais_caged.ps1 -UF SP -Saida D:\MTE_SP
+
+# Reprocessar tudo, reaproveitando os .7z já baixados
+.\pipeline_rais_caged.ps1 -Reprocessar -ManterCompactados
+
+# Execução não interativa (Agendador de Tarefas / CMD): -Bases como texto separado por vírgula
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps1 -Bases "RAIS,CAGED_MOV" -Paralelismo 4
+```
+
+---
+
+## 5. Parâmetros
+
+| Parâmetro | Padrão | Descrição |
+| --- | --- | --- |
+| `-Saida` | `$HOME\Dados\MTE` | Pasta raiz de saída |
+| `-AnoInicial` | `2020` | Primeiro ano. Na RAIS é o ano-base; no CAGED, o ano da competência do arquivo. Mínimo 2020, quando começa o Novo CAGED |
+| `-AnoFinal` | ano corrente | Último ano. A RAIS do ano corrente ainda não existe e é ignorada |
+| `-Bases` | `RAIS,CAGED` | `RAIS`, `CAGED` ou os grupos `RAIS_VINC`, `RAIS_ESTAB`, `CAGED_MOV`, `CAGED_FOR`, `CAGED_EXC`. Aceita lista ou texto com vírgulas |
+| `-UF` | `MG` | Sigla da UF filtrada (27 UFs) |
+| `-Cabecalho` | `Padronizado` | `Padronizado` (snake_case, igual em todos os anos), `Descritivo` (rótulos em português) ou `Original` (cabeçalho do MTE, sem colunas derivadas e sem unificar layouts) |
+| `-Delimitador` | `;` | `;`, `,`, `\|` ou `TAB` |
+| `-SeparadorDecimal` | `Ponto` | `Ponto` serve para SQL Server, Python e Power Query com cultura en-US; `Virgula` serve para Excel pt-BR |
+| `-ManterValoresBrutos` | desligado | Não normaliza valores: só filtra, converte o encoding e reescreve o CSV |
+| `-CompactarSaida` | desligado | Grava `.csv.gz` (8 a 10 vezes menor) |
+| `-SemBOM` | desligado | UTF-8 sem BOM. O padrão é com BOM, para o Excel reconhecer os acentos |
+| `-Consolidar` | desligado | No final, gera um arquivo único por grupo em `<Saida>\CONSOLIDADO` |
+| `-Paralelismo` | `3` | Arquivos processados ao mesmo tempo, de 1 a 8. O FTP do MTE costuma aceitar até 4 conexões |
+| `-Reprocessar` | desligado | Ignora o manifesto e reprocessa tudo |
+| `-ManterCompactados` | desligado | Mantém os `.7z` em `<Saida>\_downloads` |
+| `-Caminho7Zip` | automático | Caminho do `7z.exe` |
+| `-Baixar7Zip` | desligado | Se não achar o 7-Zip, baixa o `7zr.exe` oficial |
+| `-Motor` | `Auto` | `Auto` usa C# se possível e PowerShell como contingência. Também aceita `CSharp` ou `PowerShell` |
+| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. Funciona no 5.1, mas a retomada de download pode não funcionar |
+| `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados |
+| `-Tentativas` | `5` | Tentativas por listagem ou download, de 1 a 20 |
+| `-SomenteListar` | desligado | Simulação: lista o que seria baixado e processado |
+
+**Códigos de saída:** `0` = sucesso; `1` = terminou, mas algum arquivo ficou em erro (veja o manifesto); `2` = falha geral.
+
+---
+
+## 6. Estrutura de saída
+
+```text
+<Saida>\
+├── RAIS\
+│   ├── VINCULOS\           RAIS_VINC_MG_2020.csv ... RAIS_VINC_MG_<ano>.csv  (+ RAIS_VINC_MG_<ano>_NI.csv)
+│   └── ESTABELECIMENTOS\   RAIS_ESTAB_MG_2020.csv ...
+├── CAGED\
+│   ├── MOV\                CAGEDMOV_MG_202001.csv ... (um por competência)
+│   ├── FOR\                CAGEDFOR_MG_<AAAAMM>.csv
+│   └── EXC\                CAGEDEXC_MG_<AAAAMM>.csv
+├── CONSOLIDADO\            (com -Consolidar) ex.: CAGEDMOV_MG_202001_202609.csv
+├── _controle\
+│   ├── manifesto_MG.csv                 controle incremental + métricas de conferência
+│   ├── dicionario_colunas.csv           coluna, rótulo, tipo e origem de cada coluna de saída
+│   ├── mapeamento_cabecalhos_MG.csv     linhagem: cabeçalho de origem → coluna de saída, por arquivo
+│   ├── ddl_sqlserver_MG.sql             CREATE TABLE de staging + modelo de BULK INSERT
+│   └── logs\execucao_MG_<data_hora>.log
+├── _downloads\             .7z temporários (apagados após o processamento, salvo -ManterCompactados)
+└── _ferramentas\           7zr.exe (só com -Baixar7Zip)
+```
+
+Formato dos CSVs:
+
+- UTF-8, com BOM por padrão; quebra de linha CRLF; delimitador `;`.
+- Ponto decimal por padrão.
+- Aspas só quando o valor contém o delimitador, aspas ou quebra de linha, seguindo a RFC 4180.
+- A primeira linha é sempre o cabeçalho.
+
+---
+
+## 7. Colunas
+
+No modo **Padronizado** (padrão), as colunas e a ordem são **as mesmas em todos os anos**. Assim dá para empilhar 2020 a 2025 sem ajuste, mesmo com o MTE mudando nomes e layout entre os anos (a RAIS de 2023 em diante foi republicada em um layout novo). Uma coluna que não existe em um ano fica vazia nesse ano.
+
+Se o MTE publicar uma coluna nova, ainda fora do dicionário, ela **não se perde**. Ela entra no final, com nome em snake_case, e gera um aviso no log e no `mapeamento_cabecalhos_MG.csv`.
+
+No modo **Descritivo**, a ordem é a mesma, com os rótulos em português da coluna "Rótulo" abaixo. No modo **Original**, sai o cabeçalho do arquivo do MTE, sem colunas derivadas e sem unificar layouts entre anos.
+
+Os tipos determinam o tratamento:
+
+- **texto:** só trim e nulos. **Zeros à esquerda são preservados** (CBO, CNAE, natureza jurídica, município, CEP).
+- **inteiro** e **decimal:** normalização numérica (seção 8).
+
+#### RAIS Vínculos
+
+| # | Coluna (Padronizado) | Tipo | Rótulo (Descritivo) | Origem |
+| ---: | --- | --- | --- | --- |
+| 1 | `ano` | inteiro | Ano-base | derivada |
+| 2 | `id_municipio` | texto | Município (código IBGE, 7 dígitos) | derivada |
+| 3 | `id_municipio_6` | texto | Município do estabelecimento (código IBGE, 6 dígitos) | arquivo |
+| 4 | `id_municipio_6_trabalho` | texto | Município de trabalho (código IBGE, 6 dígitos) | arquivo |
+| 5 | `bairros_sp` | texto | Bairro (São Paulo) | arquivo |
+| 6 | `bairros_fortaleza` | texto | Bairro (Fortaleza) | arquivo |
+| 7 | `bairros_rj` | texto | Bairro (Rio de Janeiro) | arquivo |
+| 8 | `distritos_sp` | texto | Distrito (São Paulo) | arquivo |
+| 9 | `regiao_adm_df` | texto | Região administrativa (DF) | arquivo |
+| 10 | `cnae_2_classe` | texto | CNAE 2.0 - classe | arquivo |
+| 11 | `cnae_2_subclasse` | texto | CNAE 2.0 - subclasse | arquivo |
+| 12 | `cnae_95_classe` | texto | CNAE 95 - classe | arquivo |
+| 13 | `ibge_subsetor` | inteiro | Subsetor IBGE | arquivo |
+| 14 | `natureza_juridica` | texto | Natureza jurídica | arquivo |
+| 15 | `tamanho_estabelecimento` | inteiro | Tamanho do estabelecimento (faixa de empregados) | arquivo |
+| 16 | `tipo_estabelecimento` | inteiro | Tipo de estabelecimento (código) | arquivo |
+| 17 | `tipo_estabelecimento_nome` | texto | Tipo de estabelecimento (nome) | arquivo |
+| 18 | `ind_cei_vinculado` | inteiro | Indicador de CEI vinculado | arquivo |
+| 19 | `ind_simples` | inteiro | Indicador de optante pelo Simples | arquivo |
+| 20 | `tipo_vinculo` | inteiro | Tipo de vínculo | arquivo |
+| 21 | `categoria_trabalhador` | inteiro | Categoria do trabalhador | arquivo |
+| 22 | `vinculo_ativo_3112` | inteiro | Vínculo ativo em 31/12 | arquivo |
+| 23 | `ind_vinculo_abandonado` | inteiro | Indicador de vínculo abandonado | arquivo |
+| 24 | `tipo_admissao` | inteiro | Tipo de admissão | arquivo |
+| 25 | `mes_admissao` | inteiro | Mês de admissão | arquivo |
+| 26 | `mes_desligamento` | inteiro | Mês de desligamento | arquivo |
+| 27 | `motivo_desligamento` | inteiro | Motivo do desligamento | arquivo |
+| 28 | `tempo_emprego` | decimal | Tempo de emprego (meses) | arquivo |
+| 29 | `faixa_tempo_emprego` | inteiro | Faixa de tempo de emprego | arquivo |
+| 30 | `qtd_horas_contratadas` | inteiro | Horas contratadas por semana | arquivo |
+| 31 | `faixa_horas_contratadas` | inteiro | Faixa de horas contratadas | arquivo |
+| 32 | `ind_trabalho_intermitente` | inteiro | Indicador de trabalho intermitente | arquivo |
+| 33 | `ind_trabalho_parcial` | inteiro | Indicador de trabalho parcial | arquivo |
+| 34 | `cbo_2002` | texto | Ocupação (CBO 2002) | arquivo |
+| 35 | `sexo` | inteiro | Sexo | arquivo |
+| 36 | `idade` | inteiro | Idade | arquivo |
+| 37 | `faixa_etaria` | inteiro | Faixa etária | arquivo |
+| 38 | `raca_cor` | inteiro | Raça/cor | arquivo |
+| 39 | `escolaridade_apos_2005` | inteiro | Escolaridade (após 2005) | arquivo |
+| 40 | `nacionalidade` | inteiro | Nacionalidade | arquivo |
+| 41 | `ano_chegada_brasil` | inteiro | Ano de chegada ao Brasil | arquivo |
+| 42 | `ind_pcd` | inteiro | Indicador de pessoa com deficiência | arquivo |
+| 43 | `tipo_deficiencia` | inteiro | Tipo de deficiência | arquivo |
+| 44 | `vl_remuneracao_dezembro` | decimal | Remuneração de dezembro (R$) | arquivo |
+| 45 | `vl_remuneracao_dezembro_sm` | decimal | Remuneração de dezembro (salários mínimos) | arquivo |
+| 46 | `faixa_remuneracao_dezembro_sm` | inteiro | Faixa de remuneração de dezembro (SM) | arquivo |
+| 47 | `vl_remuneracao_media` | decimal | Remuneração média no ano (R$) | arquivo |
+| 48 | `vl_remuneracao_media_sm` | decimal | Remuneração média no ano (salários mínimos) | arquivo |
+| 49 | `faixa_remuneracao_media_sm` | inteiro | Faixa de remuneração média (SM) | arquivo |
+| 50 | `vl_remuneracao_janeiro` | decimal | Remuneração de janeiro (R$) | arquivo |
+| 51 | `vl_remuneracao_fevereiro` | decimal | Remuneração de fevereiro (R$) | arquivo |
+| 52 | `vl_remuneracao_marco` | decimal | Remuneração de março (R$) | arquivo |
+| 53 | `vl_remuneracao_abril` | decimal | Remuneração de abril (R$) | arquivo |
+| 54 | `vl_remuneracao_maio` | decimal | Remuneração de maio (R$) | arquivo |
+| 55 | `vl_remuneracao_junho` | decimal | Remuneração de junho (R$) | arquivo |
+| 56 | `vl_remuneracao_julho` | decimal | Remuneração de julho (R$) | arquivo |
+| 57 | `vl_remuneracao_agosto` | decimal | Remuneração de agosto (R$) | arquivo |
+| 58 | `vl_remuneracao_setembro` | decimal | Remuneração de setembro (R$) | arquivo |
+| 59 | `vl_remuneracao_outubro` | decimal | Remuneração de outubro (R$) | arquivo |
+| 60 | `vl_remuneracao_novembro` | decimal | Remuneração de novembro (R$) | arquivo |
+| 61 | `causa_afastamento_1` | inteiro | Causa do afastamento 1 | arquivo |
+| 62 | `causa_afastamento_2` | inteiro | Causa do afastamento 2 | arquivo |
+| 63 | `causa_afastamento_3` | inteiro | Causa do afastamento 3 | arquivo |
+| 64 | `qtd_dias_afastamento` | inteiro | Dias de afastamento no ano | arquivo |
+
+#### RAIS Estabelecimentos
+
+| # | Coluna (Padronizado) | Tipo | Rótulo (Descritivo) | Origem |
+| ---: | --- | --- | --- | --- |
+| 1 | `ano` | inteiro | Ano-base | derivada |
+| 2 | `id_uf` | inteiro | UF (código IBGE) | arquivo |
+| 3 | `id_municipio` | texto | Município (código IBGE, 7 dígitos) | derivada |
+| 4 | `id_municipio_6` | texto | Município (código IBGE, 6 dígitos) | arquivo |
+| 5 | `cep` | texto | CEP do estabelecimento | arquivo |
+| 6 | `bairros_sp` | texto | Bairro (São Paulo) | arquivo |
+| 7 | `bairros_fortaleza` | texto | Bairro (Fortaleza) | arquivo |
+| 8 | `bairros_rj` | texto | Bairro (Rio de Janeiro) | arquivo |
+| 9 | `distritos_sp` | texto | Distrito (São Paulo) | arquivo |
+| 10 | `regiao_adm_df` | texto | Região administrativa (DF) | arquivo |
+| 11 | `cnae_2_classe` | texto | CNAE 2.0 - classe | arquivo |
+| 12 | `cnae_2_subclasse` | texto | CNAE 2.0 - subclasse | arquivo |
+| 13 | `cnae_95_classe` | texto | CNAE 95 - classe | arquivo |
+| 14 | `ibge_subsetor` | inteiro | Subsetor IBGE | arquivo |
+| 15 | `natureza_juridica` | texto | Natureza jurídica | arquivo |
+| 16 | `tamanho_estabelecimento` | inteiro | Tamanho do estabelecimento (faixa de empregados) | arquivo |
+| 17 | `tipo_estabelecimento` | inteiro | Tipo de estabelecimento (código) | arquivo |
+| 18 | `tipo_estabelecimento_nome` | texto | Tipo de estabelecimento (nome) | arquivo |
+| 19 | `qtd_vinculos_ativos` | inteiro | Vínculos ativos em 31/12 | arquivo |
+| 20 | `qtd_vinculos_clt` | inteiro | Vínculos CLT ativos em 31/12 | arquivo |
+| 21 | `qtd_vinculos_estatutarios` | inteiro | Vínculos estatutários ativos em 31/12 | arquivo |
+| 22 | `ind_atividade_ano` | inteiro | Indicador de atividade no ano | arquivo |
+| 23 | `ind_rais_negativa` | inteiro | Indicador de RAIS negativa | arquivo |
+| 24 | `ind_cei_vinculado` | inteiro | Indicador de CEI vinculado | arquivo |
+| 25 | `ind_pat` | inteiro | Indicador de participante do PAT | arquivo |
+| 26 | `ind_simples` | inteiro | Indicador de optante pelo Simples | arquivo |
+
+#### Novo CAGED (MOV, FOR, EXC)
+
+| # | Coluna (Padronizado) | Tipo | Rótulo (Descritivo) | Origem |
+| ---: | --- | --- | --- | --- |
+| 1 | `competencia_movimentacao` | inteiro | Competência da movimentação (AAAAMM) | arquivo |
+| 2 | `competencia_declarada` | inteiro | Competência da declaração (AAAAMM) | arquivo |
+| 3 | `competencia_exclusao` | inteiro | Competência da exclusão (AAAAMM) | arquivo (só EXC) |
+| 4 | `regiao` | inteiro | Região (código IBGE) | arquivo |
+| 5 | `id_uf` | inteiro | UF (código IBGE) | arquivo |
+| 6 | `id_municipio` | texto | Município (código IBGE, 7 dígitos) | derivada |
+| 7 | `id_municipio_6` | texto | Município (código IBGE, 6 dígitos) | arquivo |
+| 8 | `cnae_2_secao` | texto | Seção CNAE 2.0 | arquivo |
+| 9 | `cnae_2_subclasse` | texto | Subclasse CNAE 2.0 | arquivo |
+| 10 | `saldo_movimentacao` | inteiro | Saldo da movimentação (1 = admissão; -1 = desligamento) | arquivo |
+| 11 | `tipo_movimentacao` | inteiro | Tipo de movimentação | arquivo |
+| 12 | `cbo_2002` | texto | Ocupação (CBO 2002) | arquivo |
+| 13 | `categoria` | inteiro | Categoria do trabalhador | arquivo |
+| 14 | `grau_instrucao` | inteiro | Grau de instrução | arquivo |
+| 15 | `idade` | inteiro | Idade | arquivo |
+| 16 | `horas_contratuais` | decimal | Horas contratuais semanais | arquivo |
+| 17 | `raca_cor` | inteiro | Raça/cor | arquivo |
+| 18 | `sexo` | inteiro | Sexo | arquivo |
+| 19 | `tipo_deficiencia` | inteiro | Tipo de deficiência | arquivo |
+| 20 | `tipo_empregador` | inteiro | Tipo de empregador | arquivo |
+| 21 | `tipo_estabelecimento` | inteiro | Tipo de estabelecimento | arquivo |
+| 22 | `tamanho_estabelecimento_jan` | inteiro | Tamanho do estabelecimento em janeiro (faixa) | arquivo |
+| 23 | `ind_trabalho_intermitente` | inteiro | Indicador de trabalho intermitente | arquivo |
+| 24 | `ind_trabalho_parcial` | inteiro | Indicador de trabalho parcial | arquivo |
+| 25 | `ind_aprendiz` | inteiro | Indicador de aprendiz | arquivo |
+| 26 | `salario` | decimal | Salário mensal (R$) | arquivo |
+| 27 | `unidade_salario` | inteiro | Unidade do salário fixo (código) | arquivo |
+| 28 | `valor_salario_fixo` | decimal | Valor do salário fixo (R$) | arquivo |
+| 29 | `origem_informacao` | inteiro | Origem da informação (1 eSocial, 2 CAGED, 3 Empregador Web) | arquivo |
+| 30 | `ind_fora_prazo` | inteiro | Indicador de declaração fora do prazo | arquivo |
+| 31 | `ind_exclusao` | inteiro | Indicador de exclusão | arquivo (só EXC) |
+
+
+---
+
+## 8. Regras de tratamento (ETL)
+
+**Formatos de origem**, detectados automaticamente arquivo a arquivo pelo cabeçalho:
+
+| Fonte | Encoding | Delimitador | Decimal | Observação |
+| --- | --- | --- | --- | --- |
+| RAIS 2020–2022 | Latin-1 | `;` | vírgula, com ponto de milhar | cabeçalho repete "Tipo Estab" (código e nome) |
+| RAIS 2023+ (republicada) | Latin-1 | `,` com aspas | ponto | cabeçalhos com sufixo " - Código"; arquivo interno `.COMT` |
+| Novo CAGED | UTF-8 | `;` | vírgula | nomes de coluna minúsculos e sem espaço (`saldomovimentação`) |
+
+**Limpeza**, que vale para todas as colunas, salvo `-ManterValoresBrutos`:
+
+- Trim de espaços, incluindo o espaço não separável.
+- Viram vazio: `{ñ class}` e qualquer valor iniciado por `{`, sequências de `*` e `n/d`.
+
+**Números** (colunas inteiro e decimal):
+
+| Origem | Saída | Regra |
+| --- | --- | --- |
+| `0000686,80` | `686.80` | zeros à esquerda removidos; vírgula vira ponto |
+| `1.234,56` | `1234.56` | ponto de milhar removido |
+| `  599,9` | `599.9` | espaços removidos |
+| `,00` | `0.00` | zero antes do separador |
+| `044` | `44` | inteiro sem zeros à esquerda |
+| `3.0` (RAIS 2023+) | `3` | inteiro sem fração zero |
+| `+5` | `5` | sinal `+` removido |
+| `-1` | `-1` | negativos preservados (ex.: `saldo_movimentacao`) |
+
+Com `-SeparadorDecimal Virgula`, o ponto decimal vira vírgula na saída.
+
+**Colunas derivadas:**
+
+- `ano`: ano-base, só na RAIS.
+- `id_municipio`: código IBGE de **7 dígitos**, calculado a partir dos 6 dígitos do MTE. Usa o dígito verificador oficial do IBGE e as 9 exceções da tabela do IBGE: 2201919, 2201988, 2202251, 2611533, 3117836, 3152131, 4305871, 5203939 e 5203962. É a chave para cruzar com malhas e dados do IBGE (geomarketing).
+
+**Filtro da UF:**
+
+- **CAGED e RAIS Estabelecimentos:** igualdade com o código IBGE da UF (MG = `31`).
+- **RAIS Vínculos:** prefixo `31` no **município do estabelecimento** (coluna "Município"). O município de trabalho ("Mun Trab") é mantido em `id_municipio_6_trabalho`. O arquivo `NI` (região não identificada) também é lido; se não tiver nenhum registro da UF, fica `SEM_DADOS` no manifesto, o que é normal.
+
+---
+
+## 9. Conferência e qualidade
+
+O `_controle\manifesto_MG.csv` tem uma linha por arquivo de origem. Os campos mais úteis:
+
+| Campo | Para que serve |
+| --- | --- |
+| `status` | `OK`, `SEM_DADOS` (o arquivo não tem registros da UF; normal no `NI`) ou `ERRO` (veja `mensagem`; a próxima execução tenta de novo) |
+| `linhas_lidas` / `linhas_saida` | registros do Brasil (ou da região) lidos e registros da UF gravados |
+| `linhas_irregulares` | linhas com número de campos diferente do cabeçalho, ajustadas e contadas (deveria ser 0) |
+| `metrica_soma` | RAIS Vínculos: soma de `vinculo_ativo_3112`, o **estoque em 31/12**. RAIS Estab.: soma de `qtd_vinculos_ativos`. CAGED: soma de `saldo_movimentacao` |
+| `metrica_positivos` / `metrica_negativos` | no CAGED: admissões e desligamentos do arquivo |
+| `tamanho_remoto` / `data_remota` | detectam republicação pelo MTE, que leva a novo download |
+| `assinatura` | configuração que gerou a saída: UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado |
+
+No final da execução, o log mostra um resumo por grupo e a **conferência do Novo CAGED por ano** (MOV + FOR − EXC). Use esses totais para comparar com o painel oficial do Novo CAGED e com o estoque oficial da RAIS de MG.
+
+---
+
+## 10. Power BI (Power Query)
+
+Para ler **uma pasta inteira** (todos os meses ou anos de um grupo) em uma tabela: Obter Dados → Consulta em Branco → Editor Avançado.
+
+```m
+let
+    // ===== Parâmetros (ajuste) =====
+    Pasta   = "C:\Users\SEU_USUARIO\Dados\MTE\CAGED\MOV",  // pasta do grupo gerada pelo script
+    Prefixo = "CAGEDMOV_MG_",     // RAIS_VINC_MG_ | RAIS_ESTAB_MG_ | CAGEDMOV_MG_ | CAGEDFOR_MG_ | CAGEDEXC_MG_
+    Gzip    = false,              // true se o script rodou com -CompactarSaida
+
+    // ===== Leitura =====
+    Arquivos  = Folder.Files(Pasta),
+    Filtrados = Table.SelectRows(Arquivos, each
+                    Text.StartsWith([Name], Prefixo)
+                    and Text.EndsWith(Text.Lower([Name]), if Gzip then ".csv.gz" else ".csv")),
+    LerCsv    = (conteudo as binary) as table =>
+                    let
+                        Bruto = if Gzip then Binary.Decompress(conteudo, Compression.GZip) else conteudo,
+                        Csv   = Csv.Document(Bruto, [Delimiter = ";", Encoding = 65001, QuoteStyle = QuoteStyle.Csv])
+                    in
+                        Table.PromoteHeaders(Csv, [PromoteAllScalars = true]),
+    Tabelas   = Table.AddColumn(Filtrados, "Dados", each LerCsv([Content])),
+    Combinado = Table.Combine(Tabelas[Dados]),
+
+    // ===== Tipagem: cultura en-US porque o script grava decimal com ponto =====
+    Tipado    = Table.TransformColumnTypes(Combinado, {
+                    {"competencia_movimentacao", Int64.Type},
+                    {"id_uf", Int64.Type},
+                    {"id_municipio", type text},
+                    {"cnae_2_subclasse", type text},
+                    {"cbo_2002", type text},
+                    {"saldo_movimentacao", Int64.Type},
+                    {"idade", Int64.Type},
+                    {"salario", type number}
+                }, "en-US")
+in
+    Tipado
+```
+
+Boas práticas para volume grande:
+
+- **Tipagem com cultura `"en-US"`.** Com o Power BI em pt-BR e sem esse argumento, `1234.56` vira `123456`.
+- **Códigos com zeros à esquerda ficam como texto** no fato e nas dimensões: `cbo_2002`, `cnae_2_subclasse`, `cnae_2_classe`, `natureza_juridica`, `id_municipio`. Assim os relacionamentos não quebram.
+- **Corte colunas logo no início** com `Table.SelectColumns`. A RAIS Vínculos tem 64 colunas e de 7 a 9 milhões de linhas por ano em MG. Para estoque, filtre `vinculo_ativo_3112 = 1`.
+- **Modelo estrela.** Fatos: vínculos, estabelecimentos e movimentações. Dimensões: município IBGE (`id_municipio`), CBO, CNAE subclasse, calendário (competência AAAAMM ou ano).
+- **Volumes grandes.** Para todos os anos da RAIS Vínculos, prefira carregar no SQL Server (seção 11) e importar views agregadas no Power BI.
+
+---
+
+## 11. SQL Server
+
+1. Execute o `_controle\ddl_sqlserver_MG.sql`. Ele cria o schema `stg` e uma tabela por grupo, por exemplo `[stg].[mte_caged_mov_mg]`, no layout padronizado. **Atenção: ele recria as tabelas (DROP + CREATE).**
+2. Carregue os arquivos. O caminho precisa ser **visível pelo serviço do SQL Server**: disco do servidor ou compartilhamento com permissão para a conta do serviço. Exige SQL Server 2017+ (`FORMAT = 'CSV'`), saída com ponto decimal e sem `-CompactarSaida`.
+
+```sql
+/* Carga de todos os meses do Novo CAGED (MOV) gerados pelo script.
+   Ajuste @pasta, @per (primeira competência) e @fim (última). */
+SET NOCOUNT ON;
+DECLARE @pasta NVARCHAR(400) = N'D:\MTE\CAGED\MOV\';
+DECLARE @per   INT = 202001, @fim INT = 202609, @sql NVARCHAR(MAX);
+
+TRUNCATE TABLE [stg].[mte_caged_mov_mg];   -- carga completa (evita duplicar)
+
+WHILE @per <= @fim
+BEGIN
+    SET @sql = N'BULK INSERT [stg].[mte_caged_mov_mg] FROM ''' + @pasta
+             + N'CAGEDMOV_MG_' + CONVERT(NVARCHAR(6), @per) + N'.csv'' WITH (FORMAT = ''CSV'', '
+             + N'FIRSTROW = 2, FIELDTERMINATOR = '';'', ROWTERMINATOR = ''0x0d0a'', CODEPAGE = ''65001'', TABLOCK);';
+    BEGIN TRY
+        EXEC sys.sp_executesql @sql;
+        PRINT CONCAT('OK      ', @per);
+    END TRY
+    BEGIN CATCH
+        PRINT CONCAT('FALHOU  ', @per, ' - ', ERROR_MESSAGE());   -- ex.: competência ainda não publicada
+    END CATCH;
+    SET @per = CASE WHEN @per % 100 = 12 THEN @per + 89 ELSE @per + 1 END;   -- 202012 -> 202101
+END;
+
+/* Fatos grandes: columnstore comprime 5-10x e acelera agregações. */
+CREATE CLUSTERED COLUMNSTORE INDEX [CCI_mte_caged_mov_mg] ON [stg].[mte_caged_mov_mg];
+
+/* Conferência: no MOV, competencia_movimentacao = competência do arquivo; a soma por ano
+   deve bater com a soma de metrica_soma do manifesto (grupo CAGED_MOV) no mesmo ano. */
+SELECT competencia_movimentacao / 100 AS ano,
+       SUM(CASE WHEN saldo_movimentacao > 0 THEN 1 ELSE 0 END) AS admissoes,
+       SUM(CASE WHEN saldo_movimentacao < 0 THEN 1 ELSE 0 END) AS desligamentos,
+       SUM(saldo_movimentacao)                                AS saldo
+FROM [stg].[mte_caged_mov_mg]
+GROUP BY competencia_movimentacao / 100
+ORDER BY ano;
+```
+
+Para a RAIS, use o mesmo modelo, iterando os anos: `RAIS_VINC_MG_<ano>.csv` e, quando existir, `RAIS_VINC_MG_<ano>_NI.csv`.
+
+---
+
+## 12. Agendamento (Agendador de Tarefas)
+
+O Novo CAGED sai todo mês e a RAIS uma vez por ano. Como a execução é incremental, rodar toda semana é barato: quando não há novidade, o script só lista o FTP.
+
+```powershell
+$acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+    '-NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\pipeline_rais_caged.ps1" ' +
+    '-Saida "D:\MTE" -Bases "RAIS,CAGED" -Paralelismo 3')
+$gatilho = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '03:00'
+Register-ScheduledTask -TaskName 'MTE - RAIS e Novo CAGED (MG)' -Action $acao -Trigger $gatilho `
+    -Description 'Atualiza incrementalmente RAIS e Novo CAGED filtrados para MG'
+```
+
+O resultado da última execução aparece no Agendador: `0` = sucesso, `1` = arquivos em erro, `2` = falha geral. O log detalhado fica em `<Saida>\_controle\logs`.
+
+---
+
+## 13. Volume, tempo e disco
+
+Os números são **ordens de grandeza para MG**. Os exatos de download aparecem no `-SomenteListar`.
+
+| Grupo | Linhas de MG | CSV (sem compactar) |
+| --- | --- | --- |
+| RAIS Vínculos | ~7–9 milhões por ano | ~2 GB por ano |
+| RAIS Estabelecimentos | ~0,8–1 milhão por ano | ~100–150 MB por ano |
+| Novo CAGED MOV | ~350–450 mil por mês | ~50 MB por mês |
+
+- **Total de 2020 até hoje:** perto de 15–20 GB de CSV, ou cerca de 2 GB com `-CompactarSaida`.
+- **Download:** os `.7z` do Novo CAGED e da RAIS Estabelecimentos são nacionais. Os de RAIS Vínculos são regionais (MG/ES/RJ).
+- **Pico de disco:** saída + `Paralelismo` × maior `.7z`. Os `.7z` são apagados depois de processados, salvo com `-ManterCompactados`.
+- **Tempo:** a rede costuma ser o gargalo, porque o FTP do MTE é lento em alguns horários. O motor C# processa de 150 a 250 mil linhas por segundo. O motor PowerShell, usado só como contingência, é cerca de 15 a 20 vezes mais lento.
+
+---
+
+## 14. Solução de problemas
+
+| Sintoma | Causa provável e solução |
+| --- | --- |
+| Não lista o FTP / timeout | A rede bloqueia FTP (porta 21 e portas passivas). Teste `Test-NetConnection ftp.mtps.gov.br -Port 21`. Se só houver proxy, use `-UsarProxySistema`; senão, rode de outra rede. O FTP do MTE também fica fora do ar às vezes: rode de novo mais tarde, porque a execução é incremental |
+| "7-Zip não encontrado" | Instale o 7-Zip, informe `-Caminho7Zip` ou use `-Baixar7Zip` |
+| "não pode ser carregado porque a execução de scripts foi desabilitada" | `Unblock-File` + `-ExecutionPolicy Bypass` (seção 3) |
+| Acentos estranhos nas mensagens | O `.ps1` perdeu o BOM ao ser editado: salve como UTF-8 com BOM. O log em arquivo é sempre UTF-8 |
+| Log avisa que o motor C# não compilou | Política de segurança bloqueando o compilador (`csc.exe`) ou falta do .NET Framework 4.5+. O script segue com o motor PowerShell: mesma saída, porém mais lento |
+| `status = ERRO` no manifesto | Veja a coluna `mensagem` e o log. A próxima execução tenta de novo só o que ficou pendente. Em `ARQUIVO_CORROMPIDO` o arquivo já é baixado de novo uma vez, sozinho |
+| Arquivo de saída em uso | Feche o CSV no Excel ou no Power BI Desktop antes de rodar |
+| Colunas novas no final do CSV | O MTE publicou uma coluna fora do dicionário. Ela foi preservada; veja `mapeamento_cabecalhos_MG.csv` |
+
+---
+
+## 15. Cuidados analíticos
+
+- **RAIS Vínculos = vínculos do ano, não pessoas nem estoque.** Para o estoque em 31/12, filtre `vinculo_ativo_3112 = 1`. Uma pessoa com dois empregos aparece duas vezes.
+- **Território da RAIS Vínculos.** O filtro usa o **município do estabelecimento**. Para análises pelo local de trabalho, use `id_municipio_6_trabalho`. A RAIS não traz município de residência.
+- **RAIS 2023+ republicada.** O layout novo trouxe colunas que não existiam, como `ind_vinculo_abandonado` e `categoria_trabalhador`, que ficam vazias nos anos anteriores. Confira séries longas com cuidado.
+- **Novo CAGED: competência.** `competencia_movimentacao` é o mês em que a admissão ou o desligamento ocorreu. `competencia_declarada` é o mês em que foi declarado. O arquivo do mês `AAAAMM` traz as declarações daquele mês. O saldo com ajustes do MTE combina MOV, FOR (declarações fora do prazo) e EXC (exclusões).
+- **Nulos.** `{ñ class}`, `****` e `n/d` viram vazio (NULL), não zero. Códigos como `-1` ("ignorado") são mantidos: trate-os nas dimensões.
+- **LGPD.** São microdados públicos e desidentificados do MTE (sem CPF, nome ou CNPJ na versão pública). Mesmo assim, evite cruzamentos que permitam reidentificar pessoas em municípios pequenos.
