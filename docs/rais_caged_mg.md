@@ -36,10 +36,12 @@ Ele baixa os microdados oficiais da **RAIS** (vínculos e estabelecimentos) e do
 Como o pipeline funciona, em cinco etapas:
 
 1. **Descoberta.** Lista o FTP e encontra todos os arquivos do período. Anos e meses novos e republicações do MTE são detectados sozinhos. A pasta `Legado` do Novo CAGED é ignorada.
-2. **Download.** Roda em paralelo, retoma arquivos `.part` interrompidos e tenta de novo com espera crescente. O tamanho baixado é conferido com o do FTP e a integridade com o CRC do 7-Zip.
+2. **Download.** Roda em paralelo, retoma arquivos `.part` interrompidos (só se o arquivo no FTP ainda for o mesmo: o `.part` leva tamanho e data no nome) e tenta de novo com espera crescente. O tamanho baixado é conferido com o do FTP e a integridade com o CRC do 7-Zip. Se o arquivo mudar no FTP durante o download, o item fica em erro na hora, sem baixar tudo de novo várias vezes, e volta na próxima execução.
 3. **Extração em streaming.** O comando é `7z e -so`. O TXT descompactado, que passa de 5 GB por ano na RAIS de MG/ES/RJ, nunca é gravado em disco.
 4. **Transformação.** O motor padrão é C#, compilado em memória via `Add-Type`. O motor PowerShell puro serve de contingência e gera saída byte a byte idêntica. A etapa filtra a UF, unifica os layouts de todos os anos, limpa e normaliza os valores e cria as colunas derivadas.
 5. **Carga.** Grava os CSVs em UTF-8 e, em `_controle`, o manifesto com contagens e métricas, o dicionário de colunas, o mapeamento de cabeçalhos e a DDL para SQL Server. Se pedido, consolida tudo em um arquivo por grupo.
+
+Só uma execução por vez usa a mesma pasta de saída (trava em `_controle\execucao.lock`): uma execução agendada e outra manual não disputam downloads nem o manifesto. A pasta pode ser movida, renomeada ou acessada por outra letra de unidade ou caminho UNC; os caminhos do manifesto são recalculados a cada execução.
 
 ---
 
@@ -120,19 +122,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | `-ManterValoresBrutos` | desligado | Não normaliza valores: só filtra, converte o encoding e reescreve o CSV |
 | `-CompactarSaida` | desligado | Grava `.csv.gz` (8 a 10 vezes menor) |
 | `-SemBOM` | desligado | UTF-8 sem BOM. O padrão é com BOM, para o Excel reconhecer os acentos |
-| `-Consolidar` | desligado | No final, gera um arquivo único por grupo em `<Saida>\CONSOLIDADO` |
+| `-Consolidar` | desligado | No final, gera um arquivo único por grupo em `<Saida>\CONSOLIDADO`, com todos os períodos OK do manifesto. Se algum período tiver sido gerado com outra configuração (decimal, delimitador, cabeçalho, valores brutos) ou estiver sem o arquivo, o consolidado anterior é mantido e o grupo fica em erro até a base ficar homogênea |
 | `-Paralelismo` | `3` | Arquivos processados ao mesmo tempo, de 1 a 8. O FTP do MTE costuma aceitar até 4 conexões |
 | `-Reprocessar` | desligado | Ignora o manifesto e reprocessa tudo |
 | `-ManterCompactados` | desligado | Mantém os `.7z` em `<Saida>\_downloads` |
-| `-Caminho7Zip` | automático | Caminho do `7z.exe` |
+| `-Caminho7Zip` | automático | Caminho do `7z.exe` (pode ser relativo à pasta atual) |
 | `-Baixar7Zip` | desligado | Se não achar o 7-Zip, baixa o `7zr.exe` oficial |
 | `-Motor` | `Auto` | `Auto` usa C# se possível e PowerShell como contingência. Também aceita `CSharp` ou `PowerShell` |
-| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. Funciona no 5.1, mas a retomada de download pode não funcionar |
+| `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: a retomada pode não funcionar, o download não é conferido pelo tamanho e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos) |
 | `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados |
 | `-Tentativas` | `5` | Tentativas por listagem ou download, de 1 a 20 |
 | `-SomenteListar` | desligado | Simulação: lista o que seria baixado e processado |
 
-**Códigos de saída:** `0` = sucesso; `1` = terminou, mas algum arquivo ficou em erro (veja o manifesto); `2` = falha geral.
+**Códigos de saída:**
+
+| Código | Significado |
+| --- | --- |
+| `0` | Sucesso |
+| `1` | Terminou, mas algo ficou pendente: arquivo em erro (veja o manifesto), pasta do FTP que não pôde ser listada, consolidação recusada ou manifesto gravado só como `.pendente.csv` |
+| `2` | Falha geral, outra execução usando a mesma pasta ou interrupção com Ctrl+C |
 
 ---
 
@@ -153,6 +161,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 │   ├── dicionario_colunas.csv           coluna, rótulo, tipo e origem de cada coluna de saída
 │   ├── mapeamento_cabecalhos_MG.csv     linhagem: cabeçalho de origem → coluna de saída, por arquivo
 │   ├── ddl_sqlserver_MG.sql             CREATE TABLE de staging + modelo de BULK INSERT
+│   ├── execucao.lock                    trava: uma execução por vez nesta pasta
+│   ├── *.pendente.csv                   (só se o manifesto/mapeamento estava aberto no Excel; incorporado na próxima execução)
 │   └── logs\execucao_MG_<data_hora>.log
 ├── _downloads\             .7z temporários (apagados após o processamento, salvo -ManterCompactados)
 └── _ferramentas\           7zr.exe (só com -Baixar7Zip)
@@ -169,7 +179,7 @@ Formato dos CSVs:
 
 ## 7. Colunas
 
-No modo **Padronizado** (padrão), as colunas e a ordem são **as mesmas em todos os anos**. Assim dá para empilhar 2020 a 2025 sem ajuste, mesmo com o MTE mudando nomes e layout entre os anos (a RAIS de 2023 em diante foi republicada em um layout novo). Uma coluna que não existe em um ano fica vazia nesse ano.
+No modo **Padronizado** (padrão), as colunas e a ordem são **as mesmas em todos os anos**. Assim dá para empilhar 2020 a 2025 sem ajustar colunas, mesmo com o MTE mudando nomes e layout entre os anos (a RAIS de 2023 em diante foi republicada em um layout novo). Uma coluna que não existe em um ano fica vazia nesse ano. Os **valores** são os publicados em cada ano: alguns códigos de "não se aplica" mudaram no layout 2023+ (veja a [seção 15](#15-cuidados-analíticos) e a coluna `observacao` do `dicionario_colunas.csv`).
 
 Se o MTE publicar uma coluna nova, ainda fora do dicionário, ela **não se perde**. Ela entra no final, com nome em snake_case, e gera um aviso no log e no `mapeamento_cabecalhos_MG.csv`.
 
@@ -177,7 +187,7 @@ No modo **Descritivo**, a ordem é a mesma, com os rótulos em português da col
 
 Os tipos determinam o tratamento:
 
-- **texto:** só trim e nulos. **Zeros à esquerda são preservados** (CBO, CNAE, natureza jurídica, município, CEP).
+- **texto:** só trim e nulos. **Zeros à esquerda são preservados** (CBO, CNAE, natureza jurídica, município, CEP). O CEP sai sempre com 8 dígitos: o layout 2023+ da RAIS Estabelecimentos publica o CEP como número (`7112000`) e o script devolve o zero à esquerda (`07112000`). Em MG os CEPs começam com 3 e não mudam.
 - **inteiro** e **decimal:** normalização numérica (seção 8).
 
 #### RAIS Vínculos
@@ -329,6 +339,8 @@ Os tipos determinam o tratamento:
 | RAIS 2023+ (republicada) | Latin-1 | `,` com aspas | ponto | cabeçalhos com sufixo " - Código"; arquivo interno `.COMT` |
 | Novo CAGED | UTF-8 | `;` | vírgula | nomes de coluna minúsculos e sem espaço (`saldomovimentação`) |
 
+**Aspas e quebras de linha.** Aspas só têm significado na fonte que as usa (RAIS 2023+: `,` e cabeçalho entre aspas). Nos formatos `;` (RAIS até 2022 e Novo CAGED), uma aspa perdida é um caractere comum e não pode "engolir" as linhas seguintes. Na fonte com aspas, um campo entre aspas pode continuar por até 20 linhas físicas além da primeira; uma aspa sem fechamento até lá é tratada como solta (o campo vai até o fim da linha) e o registro é contado como irregular. Fim de linha CR, LF ou CRLF é aceito.
+
 **Limpeza**, que vale para todas as colunas, salvo `-ManterValoresBrutos`:
 
 - Trim de espaços, incluindo o espaço não separável.
@@ -348,6 +360,8 @@ Os tipos determinam o tratamento:
 | `-1` | `-1` | negativos preservados (ex.: `saldo_movimentacao`) |
 
 Com `-SeparadorDecimal Virgula`, o ponto decimal vira vírgula na saída.
+
+**CEP** (`cep` da RAIS Estabelecimentos): 7 dígitos viram 8 com o zero à esquerda; outros valores ficam como estão. Desligado com `-ManterValoresBrutos`.
 
 **Colunas derivadas:**
 
@@ -369,13 +383,17 @@ O `_controle\manifesto_MG.csv` tem uma linha por arquivo de origem. Os campos ma
 | --- | --- |
 | `status` | `OK`, `SEM_DADOS` (o arquivo não tem registros da UF; normal no `NI`) ou `ERRO` (veja `mensagem`; a próxima execução tenta de novo) |
 | `linhas_lidas` / `linhas_saida` | registros do Brasil (ou da região) lidos e registros da UF gravados |
-| `linhas_irregulares` | linhas com número de campos diferente do cabeçalho, ajustadas e contadas (deveria ser 0) |
+| `linhas_irregulares` | registros malformados (deveria ser 0): número de campos diferente do cabeçalho ou aspas sem fechamento. Os da UF são ajustados e gravados; os que não têm a coluna do filtro, ou cuja coluna da UF pode estar deslocada, são descartados. Os 5 primeiros de cada arquivo aparecem no log com o número da linha |
 | `metrica_soma` | RAIS Vínculos: soma de `vinculo_ativo_3112`, o **estoque em 31/12**. RAIS Estab.: soma de `qtd_vinculos_ativos`. CAGED: soma de `saldo_movimentacao` |
 | `metrica_positivos` / `metrica_negativos` | no CAGED: admissões e desligamentos do arquivo |
 | `tamanho_remoto` / `data_remota` | detectam republicação pelo MTE, que leva a novo download |
 | `assinatura` | configuração que gerou a saída: UF, cabeçalho, delimitador, decimal etc. Se a configuração mudar, o arquivo é reprocessado |
 
-No final da execução, o log mostra um resumo por grupo e a **conferência do Novo CAGED por ano** (MOV + FOR − EXC). Use esses totais para comparar com o painel oficial do Novo CAGED e com o estoque oficial da RAIS de MG.
+No final da execução, o log mostra um resumo por grupo e a **conferência da carga do Novo CAGED por ano do arquivo** (MOV + FOR − EXC). Ela confere a carga (deve bater com a soma de `saldo_movimentacao` dos CSVs), mas agrupa pelo ano do **nome** do arquivo. O "saldo com ajustes" do painel oficial soma FOR e subtrai EXC na `competencia_movimentacao` de cada linha; para comparar com o painel, use a consulta da [seção 11](#11-sql-server). A soma só do MOV por ano corresponde ao saldo "sem ajustes". O `metrica_soma` da RAIS Vínculos pode ser comparado com o estoque oficial de MG.
+
+O `dicionario_colunas.csv` traz, na coluna `observacao`, as mudanças de significado de códigos entre layouts e como somar o saldo do CAGED.
+
+**Arquivos de controle abertos no Excel** não derrubam a execução. Manifesto bloqueado: o script avisa, continua os downloads, tenta gravar a cada arquivo concluído e, no fim, grava `manifesto_MG.pendente.csv` (código de saída 1), que a execução seguinte incorpora sozinha. O mapeamento segue a mesma regra. Dicionário e DDL bloqueados só geram aviso; eles são regravados na próxima execução.
 
 ---
 
@@ -472,7 +490,26 @@ GROUP BY competencia_movimentacao / 100
 ORDER BY ano;
 ```
 
-Para a RAIS, use o mesmo modelo, iterando os anos: `RAIS_VINC_MG_<ano>.csv` e, quando existir, `RAIS_VINC_MG_<ano>_NI.csv`.
+**Saldo com ajustes** (o do painel oficial): carregue também FOR e EXC (mesmo modelo, trocando `MOV` por `FOR` e `EXC`) e some pela competência da movimentação, com a exclusão subtraindo:
+
+```sql
+/* Saldo com ajustes por ano: MOV + FOR - EXC, cada linha na sua competencia_movimentacao. */
+SELECT competencia_movimentacao / 100 AS ano,
+       SUM(s)                         AS saldo_com_ajustes
+FROM (
+    SELECT competencia_movimentacao, saldo_movimentacao AS s FROM [stg].[mte_caged_mov_mg]
+    UNION ALL
+    SELECT competencia_movimentacao, saldo_movimentacao      FROM [stg].[mte_caged_for_mg]
+    UNION ALL
+    SELECT competencia_movimentacao, -saldo_movimentacao     FROM [stg].[mte_caged_exc_mg]
+) AS t
+GROUP BY competencia_movimentacao / 100
+ORDER BY ano;
+```
+
+Esse é o critério do saldo com ajustes do painel. O resultado reflete as declarações publicadas até o último arquivo carregado: cada divulgação traz FOR e EXC que revisam meses anteriores. Se a carga começar depois de 2020 (ex.: `-AnoInicial 2024`), os FOR e EXC de 2024 trazem competências de 2023 incompletas: desconsidere os anos anteriores ao início da carga.
+
+Para a RAIS, use o mesmo modelo de carga, iterando os anos: `RAIS_VINC_MG_<ano>.csv` e, quando existir, `RAIS_VINC_MG_<ano>_NI.csv`.
 
 ---
 
@@ -489,7 +526,7 @@ Register-ScheduledTask -TaskName 'MTE - RAIS e Novo CAGED (MG)' -Action $acao -T
     -Description 'Atualiza incrementalmente RAIS e Novo CAGED filtrados para MG'
 ```
 
-O resultado da última execução aparece no Agendador: `0` = sucesso, `1` = arquivos em erro, `2` = falha geral. O log detalhado fica em `<Saida>\_controle\logs`.
+O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada.
 
 ---
 
@@ -520,7 +557,13 @@ Os números são **ordens de grandeza para MG**. Os exatos de download aparecem 
 | Acentos estranhos nas mensagens | O `.ps1` perdeu o BOM ao ser editado: salve como UTF-8 com BOM. O log em arquivo é sempre UTF-8 |
 | Log avisa que o motor C# não compilou | Política de segurança bloqueando o compilador (`csc.exe`) ou falta do .NET Framework 4.5+. O script segue com o motor PowerShell: mesma saída, porém mais lento |
 | `status = ERRO` no manifesto | Veja a coluna `mensagem` e o log. A próxima execução tenta de novo só o que ficou pendente. Em `ARQUIVO_CORROMPIDO` o arquivo já é baixado de novo uma vez, sozinho |
-| Arquivo de saída em uso | Feche o CSV no Excel ou no Power BI Desktop antes de rodar |
+| Arquivo de saída em uso | Feche o CSV no Excel ou no Power BI Desktop antes de rodar. Só aquele arquivo fica em erro; a próxima execução tenta de novo |
+| "Outra execução do script já está usando a pasta" | Há outra execução (agendada ou manual) na mesma `-Saida`. Espere ela terminar. Se nenhuma estiver rodando, a trava é liberada sozinha quando o processo antigo termina |
+| "Manifesto não gravado" / `manifesto_MG.pendente.csv` | O manifesto estava aberto (ex.: Excel). Feche-o; a próxima execução incorpora o `.pendente.csv` sozinha |
+| "Consolidação de ... falhou: período(s) gerado(s) com outra configuração" | Parte dos arquivos foi gerada com outro decimal, delimitador ou cabeçalho. Rode o período completo com a configuração desejada (ou `-Reprocessar`); o consolidado anterior foi mantido |
+| "Pasta ignorada nesta execução" | Uma pasta de ano/mês do FTP não pôde ser listada. O restante foi processado (código 1); a pasta volta na próxima execução |
+| `REPUBLICADO_DURANTE_DOWNLOAD` | O arquivo mudou no FTP durante a execução. Ele é baixado de novo na próxima |
+| Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados e nenhum CSV parcial (`.tmp`) é mantido. Código de saída `2` |
 | Colunas novas no final do CSV | O MTE publicou uma coluna fora do dicionário. Ela foi preservada; veja `mapeamento_cabecalhos_MG.csv` |
 
 ---
@@ -528,8 +571,9 @@ Os números são **ordens de grandeza para MG**. Os exatos de download aparecem 
 ## 15. Cuidados analíticos
 
 - **RAIS Vínculos = vínculos do ano, não pessoas nem estoque.** Para o estoque em 31/12, filtre `vinculo_ativo_3112 = 1`. Uma pessoa com dois empregos aparece duas vezes.
-- **Território da RAIS Vínculos.** O filtro usa o **município do estabelecimento**. Para análises pelo local de trabalho, use `id_municipio_6_trabalho`. A RAIS não traz município de residência.
+- **Território da RAIS Vínculos.** O filtro usa o **município do estabelecimento**. Para análises pelo local de trabalho, use `id_municipio_6_trabalho` (de 2023 em diante, confira a proporção de `999999`, "não informado", antes de usar). A RAIS não traz município de residência.
 - **RAIS 2023+ republicada.** O layout novo trouxe colunas que não existiam, como `ind_vinculo_abandonado` e `categoria_trabalhador`, que ficam vazias nos anos anteriores. Confira séries longas com cuidado.
-- **Novo CAGED: competência.** `competencia_movimentacao` é o mês em que a admissão ou o desligamento ocorreu. `competencia_declarada` é o mês em que foi declarado. O arquivo do mês `AAAAMM` traz as declarações daquele mês. O saldo com ajustes do MTE combina MOV, FOR (declarações fora do prazo) e EXC (exclusões).
+- **RAIS Vínculos 2023+: códigos de "não se aplica" mudaram** (conferido na amostra real de 2025 de MG). `causa_afastamento_1..3`: sem afastamento = `99` até 2022 e `999` de 2023 em diante. `ano_chegada_brasil`: `0` (publicado `0000`) até 2022 e `1198` de 2023 em diante para quem não é estrangeiro; identifique estrangeiros pela `nacionalidade`. Filtros como `causa_afastamento_1 <> 99` ou `ano_chegada_brasil > 0` dão resultado errado se aplicados aos dois períodos sem ajuste.
+- **Novo CAGED: competência.** `competencia_movimentacao` é o mês em que a admissão ou o desligamento ocorreu. `competencia_declarada` é o mês em que foi declarado. O arquivo do mês `AAAAMM` traz as declarações daquele mês. O saldo com ajustes do MTE combina MOV, FOR (declarações fora do prazo) e EXC (exclusões), atribuindo FOR e EXC à `competencia_movimentacao` de cada linha, com a EXC de sinal invertido (consulta na [seção 11](#11-sql-server)).
 - **Nulos.** `{ñ class}`, `****` e `n/d` viram vazio (NULL), não zero. Códigos como `-1` ("ignorado") são mantidos: trate-os nas dimensões.
 - **LGPD.** São microdados públicos e desidentificados do MTE (sem CPF, nome ou CNPJ na versão pública). Mesmo assim, evite cruzamentos que permitam reidentificar pessoas em municípios pequenos.

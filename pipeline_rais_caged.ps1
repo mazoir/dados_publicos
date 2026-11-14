@@ -23,8 +23,11 @@
                        republicado em 2026 (2023+: ',', aspas, decimal com ponto, arquivo .COMT);
                      - encoding detectado automaticamente (RAIS em Latin-1, Novo CAGED em UTF-8);
                      - cabeçalhos padronizados e IGUAIS em todos os anos (snake_case) ou descritivos;
+                       os VALORES são os publicados em cada ano (alguns códigos de "não se aplica"
+                       mudaram no layout 2023+; veja a coluna observacao do dicionário);
                      - limpeza: trim; "{ñ class}", "****" e "n/d" viram vazio; números normalizados
-                       (zeros à esquerda, separador de milhar, separador decimal único);
+                       (zeros à esquerda, separador de milhar, separador decimal único); CEP com 8
+                       dígitos (o layout 2023+ publica o CEP como número, sem o zero à esquerda);
                      - colunas derivadas: ano-base (RAIS) e código IBGE de 7 dígitos do município.
     5. CARGA       - CSV UTF-8 (BOM opcional), um arquivo por arquivo de origem, manifesto de controle
                      com contagens e métricas de conferência, dicionário de colunas, mapeamento de
@@ -32,6 +35,9 @@
 
     Execuções seguintes são INCREMENTAIS: só processa o que é novo, foi republicado pelo MTE, teve a
     saída apagada ou foi gerado com outra configuração (delimitador, cabeçalho, decimal etc.).
+    A pasta de saída pode ser movida ou acessada por outra letra de unidade/caminho UNC: os caminhos
+    do manifesto são recalculados a cada execução. Só uma execução por vez usa a mesma pasta (trava
+    em _controle\execucao.lock).
 
 .PARAMETER Saida
     Pasta raiz de saída. Padrão: <perfil do usuário>\Dados\MTE.
@@ -69,7 +75,10 @@
     Grava UTF-8 sem BOM (o padrão é com BOM, para o Excel reconhecer acentos).
 
 .PARAMETER Consolidar
-    Ao final, gera um CSV único por grupo (ex.: CAGEDMOV_MG_202001_202609.csv) em <Saida>\CONSOLIDADO.
+    Ao final, gera um CSV único por grupo (ex.: CAGEDMOV_MG_202001_202609.csv) em <Saida>\CONSOLIDADO,
+    com TODOS os períodos OK do manifesto. Se algum período tiver sido gerado com outra configuração
+    (decimal, delimitador, cabeçalho, valores brutos) ou estiver sem o arquivo, o consolidado anterior
+    é mantido e o grupo fica em erro (código de saída 1) até a base ficar homogênea.
 
 .PARAMETER Paralelismo
     Arquivos processados ao mesmo tempo (download + ETL). Padrão 3; o FTP do MTE costuma aceitar até 4.
@@ -81,7 +90,7 @@
     Mantém os .7z baixados em <Saida>\_downloads (útil para reprocessar sem baixar de novo).
 
 .PARAMETER Caminho7Zip
-    Caminho do 7z.exe, se não estiver no local padrão nem no PATH.
+    Caminho do 7z.exe, se não estiver no local padrão nem no PATH (pode ser relativo à pasta atual).
 
 .PARAMETER Baixar7Zip
     Se o 7-Zip não for encontrado, baixa o executável oficial autônomo (7zr.exe) de www.7-zip.org.
@@ -90,8 +99,10 @@
     Auto (padrão: C# se possível, senão PowerShell), CSharp ou PowerShell.
 
 .PARAMETER UsarProxySistema
-    Acessa o FTP pelo proxy do sistema (por padrão a conexão FTP é direta). Funciona no Windows
-    PowerShell 5.1; nesse modo a retomada de download pode não estar disponível.
+    Acessa o FTP pelo proxy do sistema (por padrão a conexão FTP é direta). Só tem efeito no Windows
+    PowerShell 5.1 (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy o FTP não informa tamanho
+    nem data dos arquivos: a retomada de download pode não funcionar, o download não é conferido pelo
+    tamanho e republicações do MTE NÃO são detectadas (rode com -Reprocessar de tempos em tempos).
 
 .PARAMETER FtpBase
     Raiz dos microdados no FTP. Padrão: ftp://ftp.mtps.gov.br/pdet/microdados
@@ -122,7 +133,11 @@
     Requisitos .. PowerShell 5.1+ (.NET Framework 4.5+) ou PowerShell 7+; 7-Zip (ou -Baixar7Zip);
                   saída liberada para ftp.mtps.gov.br (porta 21 + portas passivas); modo FullLanguage.
     Encoding .... Este arquivo é UTF-8 COM BOM (obrigatório para o Windows PowerShell 5.1 ler os acentos).
-    Códigos de saída: 0 = sucesso; 1 = terminou com arquivos em erro; 2 = falha geral.
+    Códigos de saída: 0 = sucesso; 1 = terminou com arquivos em erro (download/ETL, pasta do FTP que
+                      não pôde ser listada, consolidação ou arquivo de controle não gravado);
+                      2 = falha geral, outra execução usando a mesma pasta ou interrupção (Ctrl+C).
+    Arquivos de controle abertos no Excel (manifesto, mapeamento) não derrubam a execução: o script
+    avisa, tenta de novo e, em último caso, grava <nome>.pendente.csv, incorporado na execução seguinte.
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -188,6 +203,10 @@ $Script:VersaoScript = '1.0.0'
 $Script:VersaoLayout = '1'
 $Script:Inicio = Get-Date
 $Script:ArquivoLog = $null
+$Script:Trava = $null                 # handle de _controle\execucao.lock (uma execução por pasta)
+$Script:ListagemIncompleta = $false   # alguma pasta do FTP não pôde ser listada
+$Script:ErroControle = $false         # arquivo de controle gravado só como .pendente.csv
+$Script:ManifestoAlterado = $false    # manifesto em memória difere do arquivo (pendente/caminhos)
 $Script:Utf8ComBom = New-Object System.Text.UTF8Encoding -ArgumentList $true
 
 $Script:CodigoUF = @{
@@ -388,6 +407,10 @@ $Script:FuncoesWorker = @(
 # Compatível com C# 5 (compilador do .NET Framework usado pelo Windows PowerShell 5.1) e com o Roslyn
 # do PowerShell 7. Mantido só com ASCII de propósito. As regras de normalização são as mesmas do motor
 # PowerShell (Invoke-MotorPowerShell): os dois produzem arquivos byte a byte idênticos.
+# ATENÇÃO: ao alterar este código, troque o sufixo do namespace (EtlMteV2 -> EtlMteV3) aqui E em
+# $Script:NamespaceMotor (a inicialização confere os dois). Um tipo compilado não pode ser recarregado no
+# mesmo console: sem a troca, uma segunda execução na mesma janela usaria a versão antiga já carregada.
+$Script:NamespaceMotor = 'EtlMteV2'
 $Script:CodigoCSharp = @'
 using System;
 using System.Collections.Generic;
@@ -397,13 +420,15 @@ using System.IO.Compression;
 using System.Text;
 using System.Threading;
 
-namespace EtlMteV1
+namespace EtlMteV2
 {
     public sealed class PlanoEtl
     {
         public int NumCamposOrigem;
         public char DelimitadorOrigem = ';';
         public bool DecimalVirgulaOrigem = true;
+        // false = formato sem aspas (';' da RAIS ate 2022 e do Novo CAGED): '"' e um caractere comum.
+        public bool UsaAspas = true;
         public int IndiceFiltro = -1;
         public bool FiltroPorPrefixo;
         public string ValorFiltro = "";
@@ -414,6 +439,7 @@ namespace EtlMteV1
         public string[] Constantes = new string[0];
         public int IndiceMunicipio6 = -1;
         public int IndiceMetrica = -1;
+        public int IndiceCep = -1;
         public char DecimalSaida = '.';
         public bool ManterBrutos;
     }
@@ -467,6 +493,38 @@ namespace EtlMteV1
                 return true;
             }
             return n == 3 && (v[0] == 'n' || v[0] == 'N') && v[1] == '/' && (v[2] == 'd' || v[2] == 'D');
+        }
+
+        // Codigo IBGE de UF (11-17, 21-29, 31-33, 35, 41-43, 50-53) a partir de dois caracteres.
+        public static bool EhCodigoUf(char a, char b)
+        {
+            switch (a)
+            {
+                case '1': return b >= '1' && b <= '7';
+                case '2': return b >= '1' && b <= '9';
+                case '3': return b == '1' || b == '2' || b == '3' || b == '5';
+                case '4': return b >= '1' && b <= '3';
+                case '5': return b >= '0' && b <= '3';
+            }
+            return false;
+        }
+
+        // Valor plausivel na coluna do filtro: codigo de UF ou municipio de 6 digitos com prefixo de UF.
+        public static bool FiltroPlausivel(string v, bool municipio)
+        {
+            if (!municipio) return v.Length == 2 && EhCodigoUf(v[0], v[1]);
+            if (v.Length != 6) return false;
+            for (int i = 0; i < 6; i++) { if (v[i] < '0' || v[i] > '9') return false; }
+            return EhCodigoUf(v[0], v[1]);
+        }
+
+        // CEP publicado como numero (RAIS Estabelecimentos 2023+) perde o zero a esquerda:
+        // 7 digitos ASCII -> "0" + valor (CEPs 01000-000 a 09999-999). Demais valores ficam como estao.
+        public static string Cep(string v)
+        {
+            if (v.Length != 7) return v;
+            for (int i = 0; i < 7; i++) { if (v[i] < '0' || v[i] > '9') return v; }
+            return "0" + v;
         }
 
         // Normalizacao numerica (N1..N9). decimalVirgula = formato de origem com virgula decimal e
@@ -671,6 +729,11 @@ namespace EtlMteV1
         private long _lidas;
         private volatile bool _cancelar;
 
+        // Linhas fisicas que um campo entre aspas pode atravessar (quebra de linha dentro do campo).
+        // Sem fechamento ate la, a aspa e tratada como solta: o campo vai ate o fim da linha e as
+        // linhas lidas a frente voltam para a fila (custo limitado; nada e engolido).
+        public const int MaxLinhasContinuacao = 20;
+
         public bool Cancelar { get { return _cancelar; } set { _cancelar = value; } }
         public long LinhasLidas { get { return Interlocked.Read(ref _lidas); } }
 
@@ -700,50 +763,99 @@ namespace EtlMteV1
             bool decVirgSaida = p.DecimalSaida == ',' && !brutos;
             string[] valores = new string[Math.Max(n, 1)];
             int[] plano = p.Plano;
+            // Linhas lidas a frente que voltaram para a fila (aspa sem fechamento).
+            List<string> devolvidas = new List<string>();
+            int iDev = 0;
             using (StreamReader sr = new StreamReader(entrada, enc, false, 1 << 20))
             {
                 string linha = sr.ReadLine(); // cabecalho (o plano ja foi montado a partir dele)
                 if (linha == null) return;
                 long numLinha = 1;
-                while ((linha = sr.ReadLine()) != null)
+                while (true)
                 {
+                    if (iDev < devolvidas.Count) linha = devolvidas[iDev++];
+                    else
+                    {
+                        if (iDev > 0) { devolvidas.Clear(); iDev = 0; }
+                        linha = sr.ReadLine();
+                        if (linha == null) break;
+                    }
                     numLinha++;
                     if (linha.Length == 0) continue;
                     long lidas = ++_lidas;
                     if ((lidas & 0x3FFF) == 0 && _cancelar) throw new OperationCanceledException("Processamento cancelado.");
                     long linhaInicio = numLinha;
-                    bool temAspas = linha.IndexOf('"') >= 0;
+                    bool temAspas = p.UsaAspas && linha.IndexOf('"') >= 0;
+                    bool aspaSolta = false;
+                    int fimFiltro = 0;
                     string vFiltro;
                     if (!temAspas)
                     {
-                        vFiltro = CampoSimples(linha, p.IndiceFiltro, d);
+                        vFiltro = CampoSimples(linha, p.IndiceFiltro, d, out fimFiltro);
                     }
                     else
                     {
-                        string reg = linha;
-                        while (!Normalizacao.ParseRegistro(reg, d, _campos, _sb))
+                        if (!Normalizacao.ParseRegistro(linha, d, _campos, _sb))
                         {
-                            string prox = sr.ReadLine();
-                            if (prox == null) break;
-                            numLinha++;
-                            reg = reg + "\n" + prox;
+                            StringBuilder reg = new StringBuilder(linha);
+                            List<string> extras = new List<string>();
+                            bool completo = false;
+                            while (extras.Count < MaxLinhasContinuacao)
+                            {
+                                string prox = iDev < devolvidas.Count ? devolvidas[iDev++] : sr.ReadLine();
+                                if (prox == null) break;
+                                extras.Add(prox);
+                                reg.Append('\n').Append(prox);
+                                if (Normalizacao.ParseRegistro(reg.ToString(), d, _campos, _sb)) { completo = true; break; }
+                            }
+                            if (completo) numLinha += extras.Count;
+                            else
+                            {
+                                aspaSolta = true;
+                                Normalizacao.ParseRegistro(linha, d, _campos, _sb);
+                                devolvidas.RemoveRange(0, iDev);
+                                devolvidas.InsertRange(0, extras);
+                                iDev = 0;
+                            }
                         }
                         vFiltro = p.IndiceFiltro >= 0 && p.IndiceFiltro < _campos.Count ? _campos[p.IndiceFiltro] : null;
                     }
-                    if (vFiltro == null) continue;
+                    if (vFiltro == null)
+                    {
+                        // Registro curto demais para ter a coluna do filtro: nao da para saber a UF.
+                        if (!temAspas) DividirSimples(linha, d, _campos);
+                        Irregular(linhaInicio, _campos.Count.ToString(CultureInfo.InvariantCulture) + " campos (esperado "
+                            + n.ToString(CultureInfo.InvariantCulture) + "), sem a coluna do filtro da UF; registro descartado.");
+                        continue;
+                    }
                     vFiltro = vFiltro.Trim();
                     bool passa = p.FiltroPorPrefixo
                         ? vFiltro.StartsWith(p.ValorFiltro, StringComparison.Ordinal)
                         : string.Equals(vFiltro, p.ValorFiltro, StringComparison.Ordinal);
-                    if (!passa) continue;
-                    if (!temAspas) DividirSimples(linha, d, _campos);
-                    if (_campos.Count != n)
+                    if (!passa)
                     {
-                        _r.LinhasIrregulares++;
-                        if (_r.LinhasIrregulares <= 5)
-                            _r.Avisos.Add("Linha " + linhaInicio.ToString(CultureInfo.InvariantCulture) + ": "
-                                + _campos.Count.ToString(CultureInfo.InvariantCulture) + " campos (esperado "
-                                + n.ToString(CultureInfo.InvariantCulture) + "); registro ajustado.");
+                        // Fora do filtro. Num registro malformado a coluna da UF pode estar deslocada (um registro
+                        // da UF seria descartado em silencio): conta e avisa. Contar os campos de uma linha sem
+                        // aspas custa caro; so e feito quando o valor do filtro nem parece um codigo de UF/municipio.
+                        if (aspaSolta || temAspas || !Normalizacao.FiltroPlausivel(vFiltro, p.FiltroPorPrefixo))
+                        {
+                            int qtd = temAspas ? _campos.Count : p.IndiceFiltro + 1 + ContarDelimitadores(linha, d, fimFiltro);
+                            if (aspaSolta || qtd != n)
+                                Irregular(linhaInicio, (aspaSolta ? "aspas sem fechamento; " : "") + qtd.ToString(CultureInfo.InvariantCulture)
+                                    + " campos (esperado " + n.ToString(CultureInfo.InvariantCulture) + "); registro descartado (a coluna da UF pode estar deslocada).");
+                        }
+                        continue;
+                    }
+                    if (!temAspas) DividirSimples(linha, d, _campos);
+                    if (aspaSolta)
+                    {
+                        Irregular(linhaInicio, "aspas sem fechamento; " + _campos.Count.ToString(CultureInfo.InvariantCulture)
+                            + " campos (esperado " + n.ToString(CultureInfo.InvariantCulture) + "); registro ajustado.");
+                    }
+                    else if (_campos.Count != n)
+                    {
+                        Irregular(linhaInicio, _campos.Count.ToString(CultureInfo.InvariantCulture) + " campos (esperado "
+                            + n.ToString(CultureInfo.InvariantCulture) + "); registro ajustado.");
                     }
                     for (int i = 0; i < n; i++)
                     {
@@ -754,6 +866,7 @@ namespace EtlMteV1
                             if (Normalizacao.EhNulo(v)) v = "";
                             char t = p.TiposOrigem[i];
                             if (t == 'I' || t == 'D') v = Normalizacao.Numero(v, t == 'I', p.DecimalVirgulaOrigem);
+                            else if (i == p.IndiceCep) v = Normalizacao.Cep(v);
                         }
                         valores[i] = v;
                     }
@@ -833,6 +946,14 @@ namespace EtlMteV1
             if (_w != null) { try { _w.Dispose(); } catch { } _w = null; }
         }
 
+        // Conta o registro irregular e guarda o aviso dos 5 primeiros (mesma regra do motor PowerShell).
+        private void Irregular(long linha, string texto)
+        {
+            _r.LinhasIrregulares++;
+            if (_r.LinhasIrregulares <= 5)
+                _r.Avisos.Add("Linha " + linha.ToString(CultureInfo.InvariantCulture) + ": " + texto);
+        }
+
         private void AnexarCampo(StringBuilder sb, string v)
         {
             bool precisa = false, aspas = false;
@@ -848,8 +969,10 @@ namespace EtlMteV1
             sb.Append('"');
         }
 
-        private static string CampoSimples(string s, int idx, char d)
+        // Campo idx de uma linha sem aspas (null se a linha tiver menos campos). fim = posicao logo apos o campo.
+        private static string CampoSimples(string s, int idx, char d, out int fim)
         {
+            fim = 0;
             if (idx < 0) return null;
             int ini = 0;
             for (int j = 0; j < idx; j++)
@@ -858,9 +981,17 @@ namespace EtlMteV1
                 if (pos < 0) return null;
                 ini = pos + 1;
             }
-            int fim = s.IndexOf(d, ini);
+            fim = s.IndexOf(d, ini);
             if (fim < 0) fim = s.Length;
             return s.Substring(ini, fim - ini);
+        }
+
+        // Delimitadores a partir de ini (laco simples: mais barato que uma chamada de IndexOf por campo).
+        private static int ContarDelimitadores(string s, char d, int ini)
+        {
+            int qtd = 0;
+            for (int i = ini; i < s.Length; i++) { if (s[i] == d) qtd++; }
+            return qtd;
         }
 
         private static void DividirSimples(string s, char d, List<string> campos)
@@ -1075,7 +1206,13 @@ function ConvertFrom-ListagemFtp {
             $dt = [datetime]::MinValue
             $txt = ($m.Groups['d'].Value -replace '\s+', ' ')
             $data = $txt
-            if ([datetime]::TryParseExact($txt, $fmtUnix, $inv, $estilo, [ref]$dt)) { $data = $dt.ToString('yyyy-MM-dd HH:mm', $inv) }
+            if ([datetime]::TryParseExact($txt, $fmtUnix, $inv, $estilo, [ref]$dt)) {
+                # "MMM d HH:mm" (sem ano) = últimos ~6 meses; o .NET assume o ano corrente, que pode cair no futuro.
+                if ($txt -notmatch '\d{4}$' -and $dt -gt [datetime]::Now.AddDays(1)) { $dt = $dt.AddYears(-1) }
+                # Só o dia: o servidor troca "MMM d HH:mm" por "MMM d yyyy" quando o arquivo envelhece, e essa
+                # troca não pode parecer republicação (a mudança de tamanho continua sendo detectada).
+                $data = $dt.ToString('yyyy-MM-dd', $inv)
+            }
             $ehDir = ($m.Groups['tp'].Value -eq 'd')
             $tam = [long]-1
             if (-not $ehDir) { $tam = [long]$m.Groups['t'].Value }
@@ -1117,9 +1254,21 @@ function Invoke-FtpDownload {
     <# Download com retomada (REST), novas tentativas e conferência de tamanho. Grava em .part e renomeia no fim. #>
     param(
         [string]$Url, [string]$Destino, [long]$TamanhoEsperado, [int]$Tentativas, [bool]$UsarProxy,
-        $EstadoItem, $Controle, $Fila, [string]$Id
+        $EstadoItem, $Controle, $Fila, [string]$Id, [string]$DataRemota = ''
     )
-    $part = $Destino + '.part'
+    # O .part leva o tamanho e a data do arquivo remoto no nome: um download interrompido só é retomado se
+    # o arquivo no FTP ainda for o mesmo. Depois de uma republicação nasce outro .part e os antigos saem.
+    $versao = ''
+    if ($TamanhoEsperado -gt 0) { $versao = '.{0}_{1}' -f $TamanhoEsperado, ($DataRemota -replace '\D', '') }
+    $part = $Destino + $versao + '.part'
+    $nomeDestino = Split-Path -Leaf $Destino
+    foreach ($velho in @(Get-ChildItem -LiteralPath (Split-Path -Parent $Destino) -File -ErrorAction SilentlyContinue)) {
+        if ($velho.Name.StartsWith($nomeDestino + '.', [System.StringComparison]::OrdinalIgnoreCase) -and
+            $velho.Name.EndsWith('.part', [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not [string]::Equals($velho.FullName, $part, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $velho.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
     $ultimo = $null
     for ($t = 1; $t -le $Tentativas; $t++) {
         if ($null -ne $Controle -and $Controle.Cancelar) { throw 'Cancelado pelo usuário.' }
@@ -1148,6 +1297,10 @@ function Invoke-FtpDownload {
             while (($lidos = $rs.Read($buf, 0, $buf.Length)) -gt 0) {
                 $fs.Write($buf, 0, $lidos)
                 $total += $lidos
+                if ($TamanhoEsperado -gt 0 -and $total -gt $TamanhoEsperado) {
+                    # Maior que o listado: o arquivo mudou no FTP depois da listagem. Repetir só baixaria tudo de novo.
+                    throw ('REPUBLICADO_DURANTE_DOWNLOAD: o arquivo no FTP passou do tamanho listado ({0}); provável republicação durante a execução. Ele será baixado na próxima execução.' -f (Format-BytesLocal $TamanhoEsperado))
+                }
                 if (([DateTime]::UtcNow - $marca).TotalMilliseconds -ge 500) {
                     $marca = [DateTime]::UtcNow
                     if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total }
@@ -1172,6 +1325,10 @@ function Invoke-FtpDownload {
             if ($null -ne $rs) { try { $rs.Dispose() } catch { } }
             if ($null -ne $resp) { try { $resp.Close() } catch { } }
             if ($null -ne $Controle -and $Controle.Cancelar) { throw }
+            if ($ultimo.Message -like 'REPUBLICADO_DURANTE_DOWNLOAD*') {
+                Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+                throw
+            }
             # Servidor/proxy sem suporte a retomada: recomeça do zero na próxima tentativa.
             if ($offset -gt 0 -and $ultimo.Message -match '(?i)\b(500|501|502|504)\b|REST|not supported') {
                 Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
@@ -1351,7 +1508,8 @@ function Get-EncodingAmostra {
 function Get-CabecalhoAmostra {
     param([byte[]]$Bytes, [string]$NomeEncoding, [bool]$AmostraCompleta)
     $texto = [System.Text.Encoding]::GetEncoding($NomeEncoding).GetString($Bytes).TrimStart([char]0xFEFF)
-    $fim = $texto.IndexOf("`n")
+    # CR, LF ou CRLF: a mesma regra do StreamReader.ReadLine usado pelos motores.
+    $fim = $texto.IndexOfAny([char[]]@([char]13, [char]10))
     if ($fim -lt 0) {
         if ($AmostraCompleta) { $fim = $texto.Length } else { throw 'Cabeçalho não encontrado nos primeiros 256 KB do arquivo.' }
     }
@@ -1411,7 +1569,7 @@ function New-PlanoEtl {
     #>
     param(
         [string]$Grupo, [hashtable]$Defs, [hashtable]$MetaGrupo, [string[]]$Cabecalho,
-        [char]$DelimitadorOrigem, [hashtable]$Constantes, [hashtable]$Cfg
+        [char]$DelimitadorOrigem, [hashtable]$Constantes, [hashtable]$Cfg, [bool]$UsaAspas = $true
     )
     $def = $Defs[$Grupo]
     $n = $Cabecalho.Count
@@ -1518,11 +1676,14 @@ function New-PlanoEtl {
     if ($usados.ContainsKey($MetaGrupo.Metrica)) { $indiceMetrica = [int]$usados[$MetaGrupo.Metrica] }
     $indiceMun6 = -1
     if ($usados.ContainsKey('id_municipio_6')) { $indiceMun6 = [int]$usados['id_municipio_6'] }
+    $indiceCep = -1
+    if ($usados.ContainsKey('cep')) { $indiceCep = [int]$usados['cep'] }
 
     return [pscustomobject]@{
         NumCamposOrigem      = $n
         DelimitadorOrigem    = $DelimitadorOrigem
         DecimalVirgulaOrigem = ([string]$DelimitadorOrigem -ne ',')
+        UsaAspas             = $UsaAspas
         IndiceFiltro         = $indiceFiltro
         FiltroPorPrefixo     = $porPrefixo
         ValorFiltro          = [string]$Cfg.CodigoUF
@@ -1532,6 +1693,7 @@ function New-PlanoEtl {
         Constantes           = $constValores.ToArray()
         IndiceMunicipio6     = $indiceMun6
         IndiceMetrica        = $indiceMetrica
+        IndiceCep            = $indiceCep
         DecimalSaida         = [char]$Cfg.DecimalSaida
         ManterBrutos         = [bool]$Cfg.ManterBrutos
         CabecalhoSaida       = $cabSaida.ToArray()
@@ -1543,11 +1705,12 @@ function New-PlanoEtl {
 }
 
 function ConvertTo-PlanoCSharp {
-    param($Plano)
-    $pc = New-Object EtlMteV1.PlanoEtl
+    param($Plano, [string]$Namespace)
+    $pc = New-Object ('{0}.PlanoEtl' -f $Namespace)
     $pc.NumCamposOrigem = [int]$Plano.NumCamposOrigem
     $pc.DelimitadorOrigem = [char]$Plano.DelimitadorOrigem
     $pc.DecimalVirgulaOrigem = [bool]$Plano.DecimalVirgulaOrigem
+    $pc.UsaAspas = [bool]$Plano.UsaAspas
     $pc.IndiceFiltro = [int]$Plano.IndiceFiltro
     $pc.FiltroPorPrefixo = [bool]$Plano.FiltroPorPrefixo
     $pc.ValorFiltro = [string]$Plano.ValorFiltro
@@ -1556,6 +1719,7 @@ function ConvertTo-PlanoCSharp {
     $pc.Constantes = [string[]]@($Plano.Constantes)
     $pc.IndiceMunicipio6 = [int]$Plano.IndiceMunicipio6
     $pc.IndiceMetrica = [int]$Plano.IndiceMetrica
+    $pc.IndiceCep = [int]$Plano.IndiceCep
     $pc.DecimalSaida = [char]$Plano.DecimalSaida
     $pc.ManterBrutos = [bool]$Plano.ManterBrutos
     return $pc
@@ -1611,6 +1775,14 @@ function Invoke-MotorPowerShell {
         $consts = [string[]]@($Plano.Constantes)
         $iM6 = [int]$Plano.IndiceMunicipio6
         $iMet = [int]$Plano.IndiceMetrica
+        $iCep = [int]$Plano.IndiceCep
+        $usaAspas = [bool]$Plano.UsaAspas
+        # Mesmo critério de Normalizacao.FiltroPlausivel (C#): código de UF ou município de 6 dígitos.
+        $reUfValida = '(?:1[1-7]|2[1-9]|3[1235]|4[1-3]|5[0-3])'
+        if ($prefixo) { $reFiltroPlausivel = '^' + $reUfValida + '[0-9]{4}\z' } else { $reFiltroPlausivel = '^' + $reUfValida + '\z' }
+        $maxCont = 20   # mesmo valor de Processador.MaxLinhasContinuacao (C#)
+        $devolvidas = New-Object System.Collections.Generic.List[string]
+        $iDev = 0
 
         $listaD = New-Object System.Collections.Generic.List[int]
         $listaI = New-Object System.Collections.Generic.List[int]
@@ -1659,7 +1831,13 @@ function Invoke-MotorPowerShell {
         $baseLidas = [long]$Resultado.LinhasLidas
         $baseIrreg = [long]$Resultado.LinhasIrregulares
 
-        while ($null -ne ($linha = $sr.ReadLine())) {
+        while ($true) {
+            if ($iDev -lt $devolvidas.Count) { $linha = $devolvidas[$iDev]; $iDev++ }
+            else {
+                if ($iDev -gt 0) { $devolvidas.Clear(); $iDev = 0 }
+                $linha = $sr.ReadLine()
+                if ($null -eq $linha) { break }
+            }
             $numLinha++
             if ($linha.Length -eq 0) { continue }
             $lidas++
@@ -1668,9 +1846,11 @@ function Invoke-MotorPowerShell {
                 if ($null -ne $Controle -and $Controle.Cancelar) { throw 'Processamento cancelado.' }
             }
             $linhaInicio = $numLinha
+            $aspaSolta = $false
+            $temAspas = $usaAspas -and ($linha.IndexOf('"') -ge 0)
 
             # ---------- leitura do registro ----------
-            if ($linha.IndexOf('"') -lt 0) {
+            if (-not $temAspas) {
                 $f = $linha.Split($d)
             }
             else {
@@ -1680,32 +1860,68 @@ function Invoke-MotorPowerShell {
                     if (@($f -like '*"*').Count -gt 0) { $f = $null }
                 }
                 if ($null -eq $f) {
-                    $reg = $linha
-                    while ($true) {
-                        $res = ConvertFrom-LinhaCsv -Texto $reg -Delimitador $d
-                        if ($res.Completa) { break }
-                        $prox = $sr.ReadLine()
-                        if ($null -eq $prox) { break }
-                        $numLinha++
-                        $reg = $reg + "`n" + $prox
+                    $res = ConvertFrom-LinhaCsv -Texto $linha -Delimitador $d
+                    if (-not $res.Completa) {
+                        # Campo entre aspas com quebra de linha: junta no máximo $maxCont linhas físicas.
+                        $reg = New-Object System.Text.StringBuilder -ArgumentList $linha
+                        $extras = New-Object System.Collections.Generic.List[string]
+                        $completo = $false
+                        while ($extras.Count -lt $maxCont) {
+                            if ($iDev -lt $devolvidas.Count) { $prox = $devolvidas[$iDev]; $iDev++ } else { $prox = $sr.ReadLine() }
+                            if ($null -eq $prox) { break }
+                            $extras.Add($prox)
+                            [void]$reg.Append("`n").Append($prox)
+                            $res2 = ConvertFrom-LinhaCsv -Texto $reg.ToString() -Delimitador $d
+                            if ($res2.Completa) { $completo = $true; $res = $res2; break }
+                        }
+                        if ($completo) { $numLinha += $extras.Count }
+                        else {
+                            # Aspa solta: o campo vai até o fim da linha e as linhas lidas a frente voltam para a fila.
+                            $aspaSolta = $true
+                            $devolvidas.RemoveRange(0, $iDev)
+                            $devolvidas.InsertRange(0, $extras)
+                            $iDev = 0
+                        }
                     }
                     $f = $res.Campos
                 }
             }
 
             # ---------- filtro da UF ----------
-            if ($iF -ge $f.Length) { continue }
-            $valorCampoFiltro = $f[$iF].Trim()
-            if ($prefixo) { if (-not $valorCampoFiltro.StartsWith($valorUF, [System.StringComparison]::Ordinal)) { continue } }
-            elseif (-not [string]::Equals($valorCampoFiltro, $valorUF, [System.StringComparison]::Ordinal)) { continue }
-
-            if ($f.Length -ne $n) {
+            if ($iF -ge $f.Length) {
+                # Registro curto demais para ter a coluna do filtro: não dá para saber a UF.
                 $irreg++
                 if (($baseIrreg + $irreg) -le 5) {
-                    $Resultado.Avisos.Add(('Linha {0}: {1} campos (esperado {2}); registro ajustado.' -f $linhaInicio, $f.Length, $n))
+                    $Resultado.Avisos.Add(('Linha {0}: {1} campos (esperado {2}), sem a coluna do filtro da UF; registro descartado.' -f $linhaInicio, $f.Length, $n))
+                }
+                continue
+            }
+            $valorCampoFiltro = $f[$iF].Trim()
+            if ($prefixo) { $passa = $valorCampoFiltro.StartsWith($valorUF, [System.StringComparison]::Ordinal) }
+            else { $passa = [string]::Equals($valorCampoFiltro, $valorUF, [System.StringComparison]::Ordinal) }
+            if (-not $passa) {
+                # Fora do filtro. Num registro malformado a coluna da UF pode estar deslocada: conta e avisa.
+                # Mesma regra do motor C# (lá, contar os campos de uma linha sem aspas só compensa quando o valor
+                # do filtro nem parece um código de UF/município).
+                if ($aspaSolta -or ($f.Length -ne $n -and ($temAspas -or $valorCampoFiltro -cnotmatch $reFiltroPlausivel))) {
+                    $irreg++
+                    if (($baseIrreg + $irreg) -le 5) {
+                        $prefAspas = ''
+                        if ($aspaSolta) { $prefAspas = 'aspas sem fechamento; ' }
+                        $Resultado.Avisos.Add(('Linha {0}: {1}{2} campos (esperado {3}); registro descartado (a coluna da UF pode estar deslocada).' -f $linhaInicio, $prefAspas, $f.Length, $n))
+                    }
+                }
+                continue
+            }
+
+            if ($aspaSolta -or $f.Length -ne $n) {
+                $irreg++
+                if (($baseIrreg + $irreg) -le 5) {
+                    if ($aspaSolta) { $Resultado.Avisos.Add(('Linha {0}: aspas sem fechamento; {1} campos (esperado {2}); registro ajustado.' -f $linhaInicio, $f.Length, $n)) }
+                    else { $Resultado.Avisos.Add(('Linha {0}: {1} campos (esperado {2}); registro ajustado.' -f $linhaInicio, $f.Length, $n)) }
                 }
                 if ($f.Length -lt $n) { $f = [string[]](@($f) + @(, '' * ($n - $f.Length))) }
-                else { $f = [string[]]@($f[0..($n - 1)]) }
+                elseif ($f.Length -gt $n) { $f = [string[]]@($f[0..($n - 1)]) }
             }
 
             # ---------- normalização ----------
@@ -1721,6 +1937,11 @@ function Invoke-MotorPowerShell {
             }
             else {
                 $f = @($f -replace '^\s+|\s+$', '' -replace $reNA, '')
+                if ($iCep -ge 0) {
+                    # CEP publicado como número (RAIS Estabelecimentos 2023+): 7 dígitos -> zero à esquerda.
+                    $vCep = [string]$f[$iCep]
+                    if ($vCep.Length -eq 7 -and $vCep -cmatch '^[0-9]{7}\z') { $f[$iCep] = '0' + $vCep }
+                }
                 if ($nD -gt 0) {
                     $vD = @(@($f[$idxD]) -replace '\s', '')
                     if ($decVirgOrig) { $vD = @($vD -replace '\.(?=[\d.]*,)', '' -replace $reMilhar, '' -replace ',', '.') }
@@ -1804,14 +2025,17 @@ function Invoke-EtlArquivo {
             $linhaCab = Get-CabecalhoAmostra -Bytes $amostra -NomeEncoding $enc -AmostraCompleta ($amostra.Length -lt 262144)
             $delim = Get-DelimitadorCabecalho -Linha $linhaCab
             $campos = (ConvertFrom-LinhaCsv -Texto $linhaCab -Delimitador $delim).Campos
-            $plano = New-PlanoEtl -Grupo $Item.Grupo -Defs $Defs -MetaGrupo $meta -Cabecalho $campos -DelimitadorOrigem $delim -Constantes $constantes -Cfg $Cfg
+            # Aspas só têm significado em fonte que as usa (RAIS 2023+: ',' e cabeçalho entre aspas). Nos
+            # formatos ';' (RAIS até 2022, Novo CAGED) uma aspa perdida não pode "engolir" as linhas seguintes.
+            $usaAspas = ($linhaCab.IndexOf([char]34) -ge 0) -or ($delim -eq [char]',')
+            $plano = New-PlanoEtl -Grupo $Item.Grupo -Defs $Defs -MetaGrupo $meta -Cabecalho $campos -DelimitadorOrigem $delim -Constantes $constantes -Cfg $Cfg -UsaAspas $usaAspas
             foreach ($a in $plano.Avisos) { $resultado.Avisos.Add($a) }
             if ($null -eq $cabecalhoRef) {
                 $cabecalhoRef = $plano.CabecalhoSaida
                 $mapeamento = $plano.Mapeamento
                 $colunaFiltro = $plano.ColunaFiltro
                 if ($Cfg.Motor -eq 'CSharp') {
-                    $proc = New-Object EtlMteV1.Processador -ArgumentList $Tmp, ([string[]]$cabecalhoRef), ([char]$Cfg.DelimitadorSaida), ([bool]$Cfg.Gzip), ([bool]$Cfg.Bom)
+                    $proc = New-Object ('{0}.Processador' -f $Cfg.NamespaceMotor) -ArgumentList $Tmp, ([string[]]$cabecalhoRef), ([char]$Cfg.DelimitadorSaida), ([bool]$Cfg.Gzip), ([bool]$Cfg.Bom)
                     $Est.Processador = $proc
                 }
                 else {
@@ -1830,7 +2054,7 @@ function Invoke-EtlArquivo {
                 try {
                     $s = $zip.GetEntry($ent.Nome).Open()
                     try {
-                        if ($null -ne $proc) { $proc.ProcessarStream($s, $enc, (ConvertTo-PlanoCSharp $plano)) }
+                        if ($null -ne $proc) { $proc.ProcessarStream($s, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
                         else { Invoke-MotorPowerShell -Plano $plano -Entrada $s -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
                     }
                     finally { $s.Dispose() }
@@ -1843,7 +2067,7 @@ function Invoke-EtlArquivo {
                 $tErr = $p.StandardError.ReadToEndAsync()
                 $ok = $false
                 try {
-                    if ($null -ne $proc) { $proc.ProcessarStream($p.StandardOutput.BaseStream, $enc, (ConvertTo-PlanoCSharp $plano)) }
+                    if ($null -ne $proc) { $proc.ProcessarStream($p.StandardOutput.BaseStream, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
                     else { Invoke-MotorPowerShell -Plano $plano -Entrada $p.StandardOutput.BaseStream -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
                     $ok = $true
                 }
@@ -1907,7 +2131,8 @@ function Invoke-ProcessarItem {
             $baixar = $true
             if (Test-Path -LiteralPath $Item.CaminhoLocal) {
                 $tamLocal = (Get-Item -LiteralPath $Item.CaminhoLocal).Length
-                if ($Item.Tamanho -le 0 -or $tamLocal -eq $Item.Tamanho) {
+                # Tamanho remoto desconhecido (modo proxy): o arquivo guardado só é reaproveitado sem -Reprocessar.
+                if ($tamLocal -eq $Item.Tamanho -or ($Item.Tamanho -le 0 -and $Item.Situacao -ne 'Reprocessamento forçado')) {
                     $baixar = $false
                     Write-LogFila $Fila 'INFO' $id ('Reaproveitando arquivo já baixado ({0}).' -f (Format-BytesLocal $tamLocal))
                 }
@@ -1917,7 +2142,7 @@ function Invoke-ProcessarItem {
                 $est.Fase = 'Download'
                 $t0 = Get-Date
                 Write-LogFila $Fila 'INFO' $id ('Baixando {0} ({1}).' -f $Item.NomeArquivo, (Format-BytesLocal $Item.Tamanho))
-                Invoke-FtpDownload -Url $Item.Url -Destino $Item.CaminhoLocal -TamanhoEsperado ([long]$Item.Tamanho) -Tentativas $Cfg.Tentativas -UsarProxy ([bool]$Cfg.UsarProxy) -EstadoItem $est -Controle $Controle -Fila $Fila -Id $id
+                Invoke-FtpDownload -Url $Item.Url -Destino $Item.CaminhoLocal -TamanhoEsperado ([long]$Item.Tamanho) -Tentativas $Cfg.Tentativas -UsarProxy ([bool]$Cfg.UsarProxy) -EstadoItem $est -Controle $Controle -Fila $Fila -Id $id -DataRemota ([string]$Item.DataRemota)
                 $seg = [math]::Max(0.1, ((Get-Date) - $t0).TotalSeconds)
                 Write-LogFila $Fila 'INFO' $id ('Download concluído em {0:N0}s ({1}/s).' -f $seg, (Format-BytesLocal ((Get-Item -LiteralPath $Item.CaminhoLocal).Length / $seg)))
             }
@@ -1973,6 +2198,8 @@ function Invoke-ProcessarItem {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
     finally {
+        # O finally roda também quando a execução é interrompida (o catch não): não deixa .tmp parcial.
+        if ($status -ne 'OK') { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         $est.Fase = 'Concluído'
     }
     $fim = Get-Date
@@ -2079,7 +2306,9 @@ function Get-ItensRemotos {
                 $_.EhDiretorio -and $_.Nome -match '^\d{4}$' -and [int]$_.Nome -ge $Cfg.AnoInicial -and [int]$_.Nome -le $Cfg.AnoFinal
             } | Sort-Object Nome)
         foreach ($a in $anos) {
-            $arquivos = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio })
+            # Uma pasta de ano que não pode ser listada não derruba as demais (a raiz continua obrigatória).
+            try { $arquivos = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio }) }
+            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; continue }
             foreach ($f in $arquivos) {
                 $grupo = $null; $regiao = ''
                 if (($Grupos -contains 'RAIS_VINC') -and $f.Nome -match '^RAIS_VINC_PUB_(?<reg>.+?)\.(7z|zip)$') {
@@ -2109,12 +2338,14 @@ function Get-ItensRemotos {
             } | Sort-Object Nome)
         $mapaTipo = @{ MOV = 'CAGED_MOV'; FOR = 'CAGED_FOR'; EXC = 'CAGED_EXC' }
         foreach ($a in $anos) {
-            $conteudo = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas)
+            try { $conteudo = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas) }
+            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; continue }
             $arquivos = New-Object System.Collections.Generic.List[object]
             foreach ($e in $conteudo) {
                 if (-not $e.EhDiretorio) { $arquivos.Add($e) }
                 elseif ($e.Nome -match '^\d{6}$' -and $e.Nome.StartsWith($a.Nome)) {
-                    foreach ($x in @(Get-FtpListagem -Url $e.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio })) { $arquivos.Add($x) }
+                    try { foreach ($x in @(Get-FtpListagem -Url $e.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio })) { $arquivos.Add($x) } }
+                    catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true }
                 }
             }
             foreach ($f in $arquivos) {
@@ -2146,14 +2377,44 @@ $Script:ColunasManifesto = @(
     'inicio', 'fim', 'duracao_s', 'mensagem'
 )
 
+function Get-CaminhoPendente {
+    <# manifesto_MG.csv -> manifesto_MG.pendente.csv (cópia gravada quando o original está bloqueado). #>
+    param([string]$Caminho)
+    return ($Caminho -replace '\.csv$', '.pendente.csv')
+}
+
+function Get-FontesControle {
+    <#
+        Arquivos a ler para um controle (manifesto/mapeamento), em ordem: o principal e, se existir e for mais
+        novo, o .pendente.csv que uma execução anterior gravou porque o principal estava aberto (ex.: Excel).
+    #>
+    param([string]$Caminho)
+    $fontes = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $Caminho) { $fontes.Add($Caminho) }
+    $pendente = Get-CaminhoPendente $Caminho
+    if (Test-Path -LiteralPath $pendente) {
+        if ($fontes.Count -eq 0 -or (Get-Item -LiteralPath $pendente).LastWriteTimeUtc -ge (Get-Item -LiteralPath $Caminho).LastWriteTimeUtc) {
+            Write-Log ('Incorporando {0}, gravado por uma execução anterior quando {1} estava bloqueado.' -f $pendente, (Split-Path -Leaf $Caminho)) 'AVISO'
+            $fontes.Add($pendente)
+        }
+        else {
+            Write-Log ('{0} é mais antigo que {1} e foi ignorado; apague-o se não precisar dele.' -f $pendente, (Split-Path -Leaf $Caminho)) 'AVISO'
+        }
+    }
+    return $fontes.ToArray()
+}
+
 function Import-Manifesto {
     param([string]$Caminho)
     $m = @{}
-    if (Test-Path -LiteralPath $Caminho) {
-        foreach ($l in @(Import-Csv -LiteralPath $Caminho -Delimiter ';' -Encoding UTF8)) {
+    $fontes = @(Get-FontesControle -Caminho $Caminho)
+    foreach ($fonte in $fontes) {
+        foreach ($l in @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)) {
             if ($l.PSObject.Properties['id'] -and $l.id) { $m[$l.id] = $l }
         }
     }
+    # Um pendente incorporado precisa ir para o manifesto principal assim que possível.
+    $Script:ManifestoAlterado = ($fontes.Count -gt 0 -and $fontes[$fontes.Count - 1] -ne $Caminho)
     return $m
 }
 
@@ -2173,6 +2434,76 @@ function Save-Manifesto {
     }
     finally { $w.Dispose() }
     Move-Item -LiteralPath $tmp -Destination $Caminho -Force
+    if ($Caminho -notlike '*.pendente.csv') {
+        $pendente = Get-CaminhoPendente $Caminho
+        if (Test-Path -LiteralPath $pendente) { Remove-Item -LiteralPath $pendente -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Save-ManifestoSeguro {
+    <# Grava o manifesto sem derrubar a execução se o arquivo estiver bloqueado. $true = gravado. #>
+    param([hashtable]$Manifesto, [string]$Caminho, [bool]$Avisar = $true)
+    try {
+        Save-Manifesto -Manifesto $Manifesto -Caminho $Caminho
+        return $true
+    }
+    catch {
+        if ($Avisar) {
+            Write-Log ('Manifesto não gravado ({0}). Se ele estiver aberto em outro programa (ex.: Excel), feche-o: nova tentativa a cada arquivo concluído.' -f $_.Exception.Message) 'AVISO'
+        }
+        return $false
+    }
+}
+
+function Complete-ManifestoPendente {
+    <#
+        Fim da execução com o manifesto ainda bloqueado: mais algumas tentativas e, por último, grava
+        manifesto_<UF>.pendente.csv (incorporado automaticamente na próxima execução). Nada é perdido.
+    #>
+    param([hashtable]$Manifesto, [string]$Caminho)
+    for ($k = 1; $k -le 6; $k++) {
+        Write-Log ('{0} continua bloqueado; feche-o (ex.: Excel). Nova tentativa em 5 s ({1}/6).' -f $Caminho, $k) 'AVISO'
+        Start-Sleep -Seconds 5
+        if (Save-ManifestoSeguro -Manifesto $Manifesto -Caminho $Caminho -Avisar $false) {
+            Write-Log 'Manifesto gravado.' 'OK'
+            return
+        }
+    }
+    $pendente = Get-CaminhoPendente $Caminho
+    Save-Manifesto -Manifesto $Manifesto -Caminho $pendente
+    Remove-Item -LiteralPath ($Caminho + '.tmp') -Force -ErrorAction SilentlyContinue
+    Write-Log ('Manifesto desta execução gravado em {0}. Ele será incorporado na próxima execução; feche {1} antes.' -f $pendente, (Split-Path -Leaf $Caminho)) 'ERRO'
+    $Script:ErroControle = $true
+}
+
+function Resolve-ArquivoSaida {
+    <#
+        Caminho da saída de uma linha do manifesto na pasta -Saida ATUAL. O manifesto pode ter sido gravado
+        com outro caminho (pasta movida, outra letra de unidade, UNC x unidade mapeada no Agendador).
+    #>
+    param($Linha, [hashtable]$Cfg)
+    $gravado = [string]$Linha.arquivo_saida
+    if (-not $gravado) { return '' }
+    $meta = $null
+    if ($Cfg.Grupos.Contains([string]$Linha.grupo)) { $meta = $Cfg.Grupos[[string]$Linha.grupo] }
+    if ($null -eq $meta) { return $gravado }
+    $nome = @($gravado -split '[\\/]')[-1]
+    return (Join-Path (Join-Path $Cfg.Saida (Join-Path $meta.Pasta[0] $meta.Pasta[1])) $nome)
+}
+
+function Update-CaminhosManifesto {
+    <# Atualiza arquivo_saida para a pasta -Saida atual. Devolve quantas linhas mudaram. #>
+    param([hashtable]$Manifesto, [hashtable]$Cfg)
+    $mudou = 0
+    foreach ($l in @($Manifesto.Values)) {
+        if (-not $l.PSObject.Properties['arquivo_saida'] -or -not $l.arquivo_saida) { continue }
+        $atual = Resolve-ArquivoSaida -Linha $l -Cfg $Cfg
+        if ($atual -and -not [string]::Equals($atual, [string]$l.arquivo_saida, [System.StringComparison]::Ordinal)) {
+            $l.arquivo_saida = $atual
+            $mudou++
+        }
+    }
+    return $mudou
 }
 
 function Get-SituacaoItem {
@@ -2227,8 +2558,13 @@ function Find-SeteZip {
     }
     $local = Join-Path $PastaFerramentas '7zr.exe'
     $candidatos.Add($local)
-    foreach ($c in $candidatos) {
+    for ($i = 0; $i -lt $candidatos.Count; $i++) {
+        $c = $candidatos[$i]
         if ($c -and (Test-Path -LiteralPath $c -PathType Leaf) -and (Test-SeteZip $c)) { return $c }
+        # O primeiro candidato é o informado em -Caminho7Zip: avisa em vez de trocar de 7-Zip em silêncio.
+        if ($i -eq 0 -and $Informado) {
+            Write-Log ('-Caminho7Zip "{0}" não existe ou não respondeu como 7-Zip; procurando outra instalação.' -f $Informado) 'AVISO'
+        }
     }
     if ($Baixar -and $ehWindows) {
         [void](New-Item -ItemType Directory -Force -Path $PastaFerramentas)
@@ -2246,7 +2582,11 @@ function Initialize-MotorCSharp {
         Compila o motor COM otimização: por padrão o Add-Type gera código em modo Debug (o JIT desliga as
         otimizações e o motor fica ~2-3x mais lento). PS 7+: -CompilerOptions; PS 5.1: -CompilerParameters.
     #>
-    if ('EtlMteV1.Processador' -as [type]) { return }
+    $tipo = '{0}.Processador' -f $Script:NamespaceMotor
+    if ($Script:CodigoCSharp -notmatch ('(?m)^namespace {0}\s*$' -f [regex]::Escape($Script:NamespaceMotor))) {
+        throw ('O namespace do código C# não confere com $Script:NamespaceMotor ({0}).' -f $Script:NamespaceMotor)
+    }
+    if ($tipo -as [type]) { return }
     try {
         if ($PSVersionTable.PSVersion.Major -ge 6) {
             Add-Type -TypeDefinition $Script:CodigoCSharp -Language CSharp -CompilerOptions '-optimize+' -ErrorAction Stop
@@ -2261,7 +2601,7 @@ function Initialize-MotorCSharp {
         }
     }
     catch {
-        if ('EtlMteV1.Processador' -as [type]) { return }
+        if ($tipo -as [type]) { return }
         Write-Verbose ('Compilação otimizada falhou ({0}); tentando a padrão.' -f $_.Exception.Message)
         Add-Type -TypeDefinition $Script:CodigoCSharp -Language CSharp -ErrorAction Stop
     }
@@ -2270,6 +2610,19 @@ function Initialize-MotorCSharp {
 #endregion
 
 #region ============================ 11. EXECUÇÃO PARALELA ============================
+
+function Get-ChavesEstado {
+    <#
+        Cópia das chaves do estado compartilhado TOMADA SOB O LOCK. [hashtable]::Synchronized protege leituras e
+        gravações isoladas, mas não a enumeração: sem o lock, um worker que começa um arquivo no mesmo instante
+        derruba a enumeração ("Collection was modified") e, com ela, a execução inteira.
+    #>
+    param([hashtable]$Estado)
+    [System.Threading.Monitor]::Enter($Estado.SyncRoot)
+    try { $chaves = @($Estado.Keys) }
+    finally { [System.Threading.Monitor]::Exit($Estado.SyncRoot) }
+    return , $chaves
+}
 
 function Invoke-Execucao {
     param([object[]]$Itens, [hashtable]$Cfg, [hashtable]$Defs, [hashtable]$Manifesto, [string]$CaminhoManifesto)
@@ -2290,6 +2643,7 @@ function Invoke-Execucao {
     $total = $Itens.Count
     $ultimoProgresso = [DateTime]::MinValue
     $atividade = 'RAIS/CAGED - UF {0}' -f $Cfg.UF
+    $manifestoPendente = $false
     try {
         foreach ($item in $Itens) {
             $ps = [System.Management.Automation.PowerShell]::Create()
@@ -2323,7 +2677,14 @@ function Invoke-Execucao {
                     $r = [pscustomobject]@{ IdItem = $t.Item.Id; id = $t.Item.Id; status = 'ERRO'; mensagem = 'O worker não devolveu resultado.'; Avisos = @(); Mapeamento = @() }
                 }
                 Update-ManifestoItem -Item $t.Item -Resultado $r -Manifesto $Manifesto -Cfg $Cfg
-                Save-Manifesto -Manifesto $Manifesto -Caminho $CaminhoManifesto
+                # Manifesto bloqueado (ex.: aberto no Excel) não cancela os downloads em andamento: avisa uma
+                # vez e tenta de novo a cada arquivo concluído.
+                if (Save-ManifestoSeguro -Manifesto $Manifesto -Caminho $CaminhoManifesto -Avisar (-not $manifestoPendente)) {
+                    if ($manifestoPendente) { Write-Log 'Manifesto gravado novamente.' 'OK' }
+                    $manifestoPendente = $false
+                    $Script:ManifestoAlterado = $false
+                }
+                else { $manifestoPendente = $true }
                 $resultados.Add([pscustomobject]@{ Item = $t.Item; Resultado = $r })
                 $estado.Remove($t.Item.Id)
                 foreach ($a in @($r.Avisos)) { Write-Log -Mensagem $a -Nivel 'AVISO' -Id $t.Item.Id }
@@ -2333,39 +2694,55 @@ function Invoke-Execucao {
             }
             if (([DateTime]::UtcNow - $ultimoProgresso).TotalMilliseconds -ge 1000) {
                 $ultimoProgresso = [DateTime]::UtcNow
-                $ativos = New-Object System.Collections.Generic.List[string]
-                foreach ($chave in @($estado.Keys)) {
-                    $e = $estado[$chave]
-                    if ($null -eq $e) { continue }
-                    if ($e.Fase -eq 'Download') {
-                        $pct = 0
-                        if ($e.Total -gt 0) { $pct = [int](100 * $e.Bytes / $e.Total) }
-                        $ativos.Add(('{0}: baixando {1}%' -f $chave, $pct))
+                # Barra de progresso é cosmética: nenhuma falha aqui pode interromper a execução.
+                try {
+                    $ativos = New-Object System.Collections.Generic.List[string]
+                    foreach ($chave in (Get-ChavesEstado -Estado $estado)) {
+                        $e = $estado[$chave]
+                        if ($null -eq $e) { continue }
+                        if ($e.Fase -eq 'Download') {
+                            $pct = 0
+                            if ($e.Total -gt 0) { $pct = [int](100 * $e.Bytes / $e.Total) }
+                            $ativos.Add(('{0}: baixando {1}%' -f $chave, $pct))
+                        }
+                        elseif ($e.Fase -eq 'Processando') {
+                            $l = $e.Linhas
+                            if ($null -ne $e.Processador) { try { $l = $e.Processador.LinhasLidas } catch { } }
+                            $ativos.Add(('{0}: {1:N0} linhas' -f $chave, $l))
+                        }
                     }
-                    elseif ($e.Fase -eq 'Processando') {
-                        $l = $e.Linhas
-                        if ($null -ne $e.Processador) { try { $l = $e.Processador.LinhasLidas } catch { } }
-                        $ativos.Add(('{0}: {1:N0} linhas' -f $chave, $l))
-                    }
+                    $operacao = ($ativos -join ' | ')
+                    if (-not $operacao) { $operacao = 'aguardando...' }
+                    Write-Progress -Activity $atividade -Status ('{0} de {1} arquivos concluídos' -f $concluidas, $total) -CurrentOperation $operacao -PercentComplete ([int](100 * $concluidas / [math]::Max(1, $total)))
                 }
-                $operacao = ($ativos -join ' | ')
-                if (-not $operacao) { $operacao = 'aguardando...' }
-                Write-Progress -Activity $atividade -Status ('{0} de {1} arquivos concluídos' -f $concluidas, $total) -CurrentOperation $operacao -PercentComplete ([int](100 * $concluidas / [math]::Max(1, $total)))
+                catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
             }
             if ($concluidas -lt $total) { Start-Sleep -Milliseconds 300 }
         }
+        # Todos os workers terminaram: se o manifesto ainda estiver bloqueado, insiste um pouco e, por fim,
+        # grava o .pendente.csv (nada do que foi processado se perde).
+        if ($manifestoPendente) { Complete-ManifestoPendente -Manifesto $Manifesto -Caminho $CaminhoManifesto }
     }
     finally {
         $pendentes = @($tarefas | Where-Object { -not $_.Coletado })
         if ($pendentes.Count -gt 0) {
             $controle.Cancelar = $true
-            foreach ($chave in @($estado.Keys)) {
+            foreach ($chave in (Get-ChavesEstado -Estado $estado)) {
                 $e = $estado[$chave]
                 if ($null -eq $e) { continue }
                 try { if ($null -ne $e.Processador) { $e.Processador.Cancelar = $true } } catch { }
                 try { if ($null -ne $e.Processo -and -not $e.Processo.HasExited) { $e.Processo.Kill() } } catch { }
             }
             foreach ($t in $pendentes) { try { [void]$t.PS.BeginStop($null, $null) } catch { } }
+            # Alguns segundos para os workers fecharem arquivos e apagarem os .tmp parciais (só .NET aqui:
+            # durante um Ctrl+C o pipeline está parando e cmdlets como Start-Sleep podem ser recusados).
+            $limite = [DateTime]::UtcNow.AddSeconds(15)
+            while ([DateTime]::UtcNow -lt $limite) {
+                $abertos = 0
+                foreach ($t in $pendentes) { if (-not $t.Handle.IsCompleted) { $abertos++ } }
+                if ($abertos -eq 0) { break }
+                [System.Threading.Thread]::Sleep(200)
+            }
             Write-Log ('Execução interrompida: {0} arquivo(s) cancelado(s). Downloads parciais serão retomados na próxima execução.' -f $pendentes.Count) 'AVISO'
             try { [void]$pool.BeginClose($null, $null) } catch { }
         }
@@ -2379,8 +2756,6 @@ function Invoke-Execucao {
 
 function Update-ManifestoItem {
     param($Item, $Resultado, [hashtable]$Manifesto, [hashtable]$Cfg)
-    $anterior = $null
-    if ($Manifesto.ContainsKey($Item.Id)) { $anterior = $Manifesto[$Item.Id] }
     $linha = [ordered]@{}
     foreach ($c in $Script:ColunasManifesto) {
         $p = $Resultado.PSObject.Properties[$c]
@@ -2393,11 +2768,15 @@ function Update-ManifestoItem {
     if (-not $linha['assinatura']) { $linha['assinatura'] = $Cfg.Assinatura }
     if (-not $linha['motor']) { $linha['motor'] = $Cfg.Motor }
     $Manifesto[$Item.Id] = [pscustomobject]$linha
-    # Saída antiga com outro nome/extensão (ex.: .csv -> .csv.gz) não pode ficar duplicando dados.
-    if ($null -ne $anterior -and $linha['status'] -eq 'OK') {
-        $velho = [string]$anterior.arquivo_saida
-        if ($velho -and $velho -ne $linha['arquivo_saida'] -and (Test-Path -LiteralPath $velho)) {
-            Remove-Item -LiteralPath $velho -Force -ErrorAction SilentlyContinue
+    # A mesma saída com a outra extensão (.csv <-> .csv.gz, quando -CompactarSaida muda) não pode ficar
+    # duplicando dados. Para um mesmo item só a extensão muda; nada fora da pasta -Saida atual é tocado.
+    if ($linha['status'] -eq 'OK' -and $linha['arquivo_saida']) {
+        $atual = [string]$linha['arquivo_saida']
+        if ($atual.EndsWith('.gz', [System.StringComparison]::OrdinalIgnoreCase)) { $irmao = $atual.Substring(0, $atual.Length - 3) }
+        else { $irmao = $atual + '.gz' }
+        if (Test-Path -LiteralPath $irmao) {
+            try { Remove-Item -LiteralPath $irmao -Force -ErrorAction Stop }
+            catch { Write-Log ('Não foi possível apagar {0} ({1}); apague-o à mão para não duplicar dados.' -f $irmao, $_.Exception.Message) 'AVISO' -Id $Item.Id }
         }
     }
 }
@@ -2423,19 +2802,47 @@ function Read-LinhaBytes {
     return , $bytes
 }
 
+function Get-AssinaturaConteudo {
+    <# Parte da assinatura que muda o CONTEÚDO do CSV (Gz e BOM não mudam: a consolidação lê os dois). #>
+    param([string]$Assinatura)
+    return ($Assinatura -replace '\|Gz=\d\|Bom=\d$', '')
+}
+
 function Merge-Consolidado {
-    <# Concatena as saídas de um grupo num único CSV (cabeçalho uma vez), em streaming de bytes. #>
+    <#
+        Concatena as saídas de um grupo num único CSV (cabeçalho uma vez), em streaming de bytes. Só consolida
+        uma base homogênea e completa; caso contrário mantém o consolidado anterior e lança erro (exit 1).
+    #>
     param([string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg)
-    $arquivos = @($Linhas | Where-Object { $_.status -eq 'OK' -and $_.arquivo_saida -and (Test-Path -LiteralPath $_.arquivo_saida) } | Sort-Object periodo, regiao)
-    if ($arquivos.Count -eq 0) { return }
+    $linhasOk = @($Linhas | Where-Object { $_.status -eq 'OK' } | Sort-Object periodo, regiao)
+    if ($linhasOk.Count -eq 0) { return }
+    # Períodos gerados com outra configuração (ex.: decimal com vírgula) não podem ser misturados.
+    $fmtAtual = Get-AssinaturaConteudo $Cfg.Assinatura
+    $outraCfg = @($linhasOk | Where-Object { (Get-AssinaturaConteudo ([string]$_.assinatura)) -ne $fmtAtual } | ForEach-Object { ('{0} {1}' -f $_.periodo, $_.regiao).Trim() })
+    if ($outraCfg.Count -gt 0) {
+        throw ('{0} período(s) gerado(s) com outra configuração ({1}). Rode com o período completo (-AnoInicial {2}) ou com -Reprocessar antes de consolidar; consolidado anterior mantido.' -f $outraCfg.Count, ($outraCfg -join ', '), ([string]$linhasOk[0].periodo).Substring(0, 4))
+    }
+    $arquivos = New-Object System.Collections.Generic.List[string]
+    $ausentes = New-Object System.Collections.Generic.List[string]
+    foreach ($l in $linhasOk) {
+        $caminho = Resolve-ArquivoSaida -Linha $l -Cfg $Cfg
+        if ($caminho -and (Test-Path -LiteralPath $caminho)) { $arquivos.Add($caminho) }
+        else { $ausentes.Add((('{0} {1}' -f $l.periodo, $l.regiao).Trim())) }
+    }
+    if ($ausentes.Count -gt 0) {
+        throw ('saída ausente para {0}: rode de novo cobrindo esse(s) período(s) para regenerá-la(s); consolidado anterior mantido.' -f ($ausentes -join ', '))
+    }
+    $emErro = @($Linhas | Where-Object { $_.status -eq 'ERRO' } | Sort-Object periodo, regiao | ForEach-Object { ('{0} {1}' -f $_.periodo, $_.regiao).Trim() })
+    if ($emErro.Count -gt 0) {
+        Write-Log ('Consolidado de {0} SEM o(s) período(s) em erro: {1} (veja o manifesto; a próxima execução tenta de novo).' -f $Grupo, ($emErro -join ', ')) 'AVISO'
+    }
     $meta = $Cfg.Grupos[$Grupo]
     $ext = '.csv'
     if ($Cfg.Gzip) { $ext = '.csv.gz' }
     $pasta = Join-Path $Cfg.Saida 'CONSOLIDADO'
     [void](New-Item -ItemType Directory -Force -Path $pasta)
     $prefixoArq = '{0}_{1}_' -f $meta.Prefixo, $Cfg.UF
-    foreach ($velho in @(Get-ChildItem -LiteralPath $pasta -File | Where-Object { $_.Name.StartsWith($prefixoArq) })) { Remove-Item -LiteralPath $velho.FullName -Force }
-    $nome = '{0}{1}_{2}{3}' -f $prefixoArq, $arquivos[0].periodo, $arquivos[$arquivos.Count - 1].periodo, $ext
+    $nome = '{0}{1}_{2}{3}' -f $prefixoArq, $linhasOk[0].periodo, $linhasOk[$linhasOk.Count - 1].periodo, $ext
     $destino = Join-Path $pasta $nome
     $tmp = $destino + '.tmp'
     $fsOut = [System.IO.File]::Create($tmp)
@@ -2446,14 +2853,14 @@ function Merge-Consolidado {
         if ($Cfg.Bom) { $out.Write([byte[]](0xEF, 0xBB, 0xBF), 0, 3) }
         $cabRef = $null
         foreach ($a in $arquivos) {
-            $fsIn = [System.IO.File]::OpenRead($a.arquivo_saida)
+            $fsIn = [System.IO.File]::OpenRead($a)
             $in = $fsIn
-            if ($a.arquivo_saida -like '*.gz') { $in = New-Object System.IO.Compression.GZipStream -ArgumentList $fsIn, ([System.IO.Compression.CompressionMode]::Decompress) }
+            if ($a -like '*.gz') { $in = New-Object System.IO.Compression.GZipStream -ArgumentList $fsIn, ([System.IO.Compression.CompressionMode]::Decompress) }
             try {
                 $cab = Read-LinhaBytes -Stream $in
                 if ($null -eq $cabRef) { $cabRef = $cab; $out.Write($cab, 0, $cab.Length) }
                 elseif ([Convert]::ToBase64String($cab) -ne [Convert]::ToBase64String($cabRef)) {
-                    throw ('o cabeçalho de {0} difere dos demais' -f $a.arquivo_saida)
+                    throw ('o cabeçalho de {0} difere dos demais' -f $a)
                 }
                 $in.CopyTo($out, 1048576)
             }
@@ -2466,39 +2873,74 @@ function Merge-Consolidado {
         if (-not [object]::ReferenceEquals($out, $fsOut)) { $fsOut.Dispose() }
         if (-not $ok) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
-    Move-Item -LiteralPath $tmp -Destination $destino -Force
+    # Só agora, com o novo arquivo completo, os consolidados anteriores do grupo saem.
+    try {
+        foreach ($velho in @(Get-ChildItem -LiteralPath $pasta -File | Where-Object { $_.Name.StartsWith($prefixoArq, [System.StringComparison]::OrdinalIgnoreCase) -and -not $_.Name.EndsWith('.tmp', [System.StringComparison]::OrdinalIgnoreCase) -and $_.Name -ne $nome })) {
+            Remove-Item -LiteralPath $velho.FullName -Force
+        }
+        Move-Item -LiteralPath $tmp -Destination $destino -Force
+    }
+    catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw ('não foi possível substituir o consolidado anterior (aberto em outro programa?): {0}' -f $_.Exception.Message)
+    }
     Write-Log ('Consolidado {0}: {1} arquivo(s) -> {2} ({3})' -f $Grupo, $arquivos.Count, $destino, (Format-Bytes (Get-Item -LiteralPath $destino).Length)) 'OK'
+}
+
+# Observações por coluna no dicionário (grupo|coluna). Os valores saem como publicados pelo MTE; estas notas
+# avisam onde o significado de um código mudou entre layouts (conferido na amostra real da RAIS 2025 de MG).
+$Script:ObservacoesColunas = @{
+    'RAIS_VINC|causa_afastamento_1'     = 'Sem afastamento: 99 até 2022; 999 no layout 2023+.'
+    'RAIS_VINC|causa_afastamento_2'     = 'Sem afastamento: 99 até 2022; 999 no layout 2023+.'
+    'RAIS_VINC|causa_afastamento_3'     = 'Sem afastamento: 99 até 2022; 999 no layout 2023+.'
+    'RAIS_VINC|ano_chegada_brasil'      = 'Não se aplica: 0 (publicado 0000) até 2022; 1198 no layout 2023+. Identifique estrangeiros pela nacionalidade.'
+    'RAIS_VINC|id_municipio_6_trabalho' = 'No layout 2023+ pode vir 999999 (não informado); confira a proporção antes de usar.'
+    'RAIS_ESTAB|cep'                    = 'Sempre 8 dígitos: no layout 2023+ o CEP vem como número e o script devolve o zero à esquerda.'
+    'CAGED_MOV|saldo_movimentacao'      = 'Saldo com ajustes: MOV + FOR - EXC, somados pela competencia_movimentacao.'
+    'CAGED_FOR|saldo_movimentacao'      = 'Declaração fora do prazo: some na competencia_movimentacao (saldo com ajustes).'
+    'CAGED_EXC|saldo_movimentacao'      = 'Exclusão: SUBTRAIA na competencia_movimentacao (saldo com ajustes).'
 }
 
 function Export-Dicionario {
     param([string]$Caminho, [string[]]$Grupos, [hashtable]$Defs)
     $tipoNome = @{ T = 'texto'; I = 'inteiro'; D = 'decimal' }
-    $w = New-Object System.IO.StreamWriter -ArgumentList $Caminho, $false, $Script:Utf8ComBom
+    $tmp = $Caminho + '.tmp'
+    $w = New-Object System.IO.StreamWriter -ArgumentList $tmp, $false, $Script:Utf8ComBom
     try {
-        $w.WriteLine((ConvertTo-LinhaCsvSaida -Valores @('grupo', 'ordem', 'coluna', 'rotulo', 'tipo', 'origem') -Delimitador ';'))
+        $w.WriteLine((ConvertTo-LinhaCsvSaida -Valores @('grupo', 'ordem', 'coluna', 'rotulo', 'tipo', 'origem', 'observacao') -Delimitador ';'))
         foreach ($g in $Grupos) {
             $ordem = 0
             foreach ($c in $Defs[$g].Colunas) {
                 $ordem++
                 $origem = 'derivada: ' + [string]$c.Derivada
                 if (-not $c.Derivada) { $origem = 'chaves: ' + (@($c.Chaves) -join ', ') }
-                $w.WriteLine((ConvertTo-LinhaCsvSaida -Valores @($g, [string]$ordem, $c.Nome, $c.Rotulo, $tipoNome[$c.Tipo], $origem) -Delimitador ';'))
+                $obs = ''
+                $chaveObs = '{0}|{1}' -f $g, $c.Nome
+                if ($Script:ObservacoesColunas.ContainsKey($chaveObs)) { $obs = $Script:ObservacoesColunas[$chaveObs] }
+                $w.WriteLine((ConvertTo-LinhaCsvSaida -Valores @($g, [string]$ordem, $c.Nome, $c.Rotulo, $tipoNome[$c.Tipo], $origem, $obs) -Delimitador ';'))
             }
         }
     }
     finally { $w.Dispose() }
+    try { Move-Item -LiteralPath $tmp -Destination $Caminho -Force }
+    catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
 }
 
 function Export-Mapeamento {
-    <# Histórico de cabeçalhos de origem -> colunas de saída, por arquivo processado (linhagem). #>
+    <#
+        Histórico de cabeçalhos de origem -> colunas de saída, por arquivo processado (linhagem). Se o arquivo
+        estiver bloqueado, grava <nome>.pendente.csv, que a execução seguinte incorpora (nada se perde).
+    #>
     param([string]$Caminho, [object[]]$Resultados)
     $cols = @('id', 'grupo', 'periodo', 'posicao_origem', 'cabecalho_origem', 'coluna_saida', 'tipo')
     $linhas = @{}
-    if (Test-Path -LiteralPath $Caminho) {
-        foreach ($l in @(Import-Csv -LiteralPath $Caminho -Delimiter ';' -Encoding UTF8)) {
-            if (-not $linhas.ContainsKey($l.id)) { $linhas[$l.id] = New-Object System.Collections.Generic.List[object] }
-            $linhas[$l.id].Add($l)
+    foreach ($fonte in @(Get-FontesControle -Caminho $Caminho)) {
+        $daFonte = @{}
+        foreach ($l in @(Import-Csv -LiteralPath $fonte -Delimiter ';' -Encoding UTF8)) {
+            if (-not $daFonte.ContainsKey($l.id)) { $daFonte[$l.id] = New-Object System.Collections.Generic.List[object] }
+            $daFonte[$l.id].Add($l)
         }
+        foreach ($id in $daFonte.Keys) { $linhas[$id] = $daFonte[$id] }
     }
     foreach ($x in $Resultados) {
         $mapa = @($x.Resultado.Mapeamento)
@@ -2509,7 +2951,8 @@ function Export-Mapeamento {
         }
         $linhas[$x.Item.Id] = $lista
     }
-    $w = New-Object System.IO.StreamWriter -ArgumentList $Caminho, $false, $Script:Utf8ComBom
+    $tmp = $Caminho + '.tmp'
+    $w = New-Object System.IO.StreamWriter -ArgumentList $tmp, $false, $Script:Utf8ComBom
     try {
         $w.WriteLine((ConvertTo-LinhaCsvSaida -Valores $cols -Delimitador ';'))
         foreach ($id in @($linhas.Keys | Sort-Object)) {
@@ -2519,6 +2962,16 @@ function Export-Mapeamento {
         }
     }
     finally { $w.Dispose() }
+    $pendente = Get-CaminhoPendente $Caminho
+    try {
+        Move-Item -LiteralPath $tmp -Destination $Caminho -Force
+        if (Test-Path -LiteralPath $pendente) { Remove-Item -LiteralPath $pendente -Force -ErrorAction SilentlyContinue }
+    }
+    catch {
+        $motivo = $_.Exception.Message
+        Move-Item -LiteralPath $tmp -Destination $pendente -Force
+        Write-Log ('{0} está bloqueado ({1}); o mapeamento foi gravado em {2} e será incorporado na próxima execução.' -f (Split-Path -Leaf $Caminho), $motivo, $pendente) 'AVISO'
+    }
 }
 
 function Export-DdlSqlServer {
@@ -2585,10 +3038,12 @@ function Write-Resumo {
     if ($tabela) {
         foreach ($l in (($tabela | Format-Table -AutoSize | Out-String -Width 200) -split "`r?`n")) { if ($l.Trim()) { Write-Log $l } }
     }
-    # Conferência do Novo CAGED: saldo por ano = MOV + FOR - EXC (soma de saldo_movimentacao por arquivo).
+    # Conferência da CARGA do Novo CAGED: soma de saldo_movimentacao por ano do NOME do arquivo (MOV + FOR - EXC).
+    # Não é o "saldo com ajustes" do painel oficial, que atribui FOR e EXC à competência da movimentação de cada
+    # linha (consulta SQL na documentação). A soma só do MOV por ano corresponde ao saldo "sem ajustes".
     $caged = @($linhas | Where-Object { $_.grupo -like 'CAGED_*' -and $_.status -eq 'OK' })
     if ($caged.Count -gt 0) {
-        Write-Log 'Conferência Novo CAGED (saldo por ano do arquivo; MOV + FOR - EXC):'
+        Write-Log 'Conferência da carga do Novo CAGED por ano do ARQUIVO (MOV + FOR - EXC). Não é o "saldo com ajustes" do painel oficial, que soma FOR e subtrai EXC na competência da movimentação; para comparar com o painel, use a consulta por competencia_movimentacao da documentação.'
         foreach ($ano in @($caged | ForEach-Object { ([string]$_.periodo).Substring(0, 4) } | Sort-Object -Unique)) {
             $s = @{ CAGED_MOV = [decimal]0; CAGED_FOR = [decimal]0; CAGED_EXC = [decimal]0 }
             foreach ($l in @($caged | Where-Object { ([string]$_.periodo).StartsWith($ano) })) {
@@ -2602,9 +3057,67 @@ function Write-Resumo {
 
 #endregion
 
+function Lock-PastaSaida {
+    <#
+        Trava de execução única por pasta -Saida (_controle\execucao.lock aberto sem compartilhamento durante
+        toda a execução). Evita que uma execução agendada e outra manual baixem o mesmo arquivo e disputem
+        o manifesto. O sistema operacional libera a trava quando o processo termina, mesmo após uma queda.
+    #>
+    param([string]$PastaControle, [string]$Saida)
+    $arquivo = Join-Path $PastaControle 'execucao.lock'
+    try {
+        $fs = New-Object System.IO.FileStream -ArgumentList $arquivo, ([System.IO.FileMode]::OpenOrCreate), ([System.IO.FileAccess]::ReadWrite), ([System.IO.FileShare]::None)
+    }
+    catch {
+        $motivo = $_.Exception.Message
+        if ($null -ne $_.Exception.InnerException) { $motivo = $_.Exception.InnerException.Message }
+        throw ('Outra execução do script já está usando a pasta {0}; aguarde o término dela. (Trava {1}: {2})' -f $Saida, $arquivo, $motivo)
+    }
+    try {
+        $info = [System.Text.Encoding]::UTF8.GetBytes(('PID {0} | início {1} | UF {2}' -f $PID, $Script:Inicio.ToString('yyyy-MM-dd HH:mm:ss'), $UF))
+        $fs.SetLength(0); $fs.Write($info, 0, $info.Length); $fs.Flush()
+    }
+    catch { }
+    return $fs
+}
+
+function Clear-TemporariosOrfaos {
+    <# Remove .tmp deixados por execuções interrompidas (só é chamado com a trava da pasta). #>
+    param([hashtable]$Cfg, [string]$PastaControle)
+    $pastas = New-Object System.Collections.Generic.List[string]
+    foreach ($m in $Cfg.Grupos.Values) { $pastas.Add((Join-Path $Cfg.Saida (Join-Path $m.Pasta[0] $m.Pasta[1]))) }
+    $pastas.Add((Join-Path $Cfg.Saida 'CONSOLIDADO'))
+    $pastas.Add($PastaControle)
+    $qtd = 0
+    $bytes = [double]0
+    foreach ($p in $pastas) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $p -File -ErrorAction SilentlyContinue)) {
+            if (-not $f.Name.EndsWith('.tmp', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            try { $tam = $f.Length; Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $qtd++; $bytes += $tam } catch { }
+        }
+    }
+    if ($qtd -gt 0) { Write-Log ('{0} arquivo(s) temporário(s) de execuções interrompidas removido(s) ({1}).' -f $qtd, (Format-Bytes $bytes)) }
+}
+
+function Test-ProcessoDedicado {
+    <#
+        $true quando o processo do PowerShell foi aberto só para este script (-File/-Command, ex.: Agendador de
+        Tarefas) e vai fechar ao fim dele. Só nesse caso o código de saída é forçado após um Ctrl+C: num console
+        interativo isso fecharia a janela do usuário.
+    #>
+    $argumentos = @([System.Environment]::GetCommandLineArgs() | Select-Object -Skip 1)
+    if (@($argumentos | Where-Object { $_ -match '^(-|/|--)(noe|noex|noexi|noexit)$' }).Count -gt 0) { return $false }
+    if (@($argumentos | Where-Object { $_ -match '^(-|/|--)(f|fi|fil|file|c|co|com|comm|comma|comman|command|e|ec|enc|enco|encod|encode|encoded|encodedcommand)$' }).Count -gt 0) { return $true }
+    return (@($argumentos | Where-Object { $_ -like '*.ps1' }).Count -gt 0)
+}
+
+#endregion
+
 #region ============================ 13. PRINCIPAL ============================
 
 $codigoSaida = 0
+$terminou = $false
 try {
     if ($AnoFinal -lt $AnoInicial) { throw '-AnoFinal deve ser maior ou igual a -AnoInicial.' }
     if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
@@ -2612,6 +3125,8 @@ try {
     }
 
     $Saida = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Saida)
+    # Caminho relativo do 7-Zip: o Process.Start resolve pela pasta do PROCESSO, não pela pasta atual do PowerShell.
+    if ($Caminho7Zip) { $Caminho7Zip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Caminho7Zip) }
     $pastaControle = Join-Path $Saida '_controle'
     $pastaLogs = Join-Path $pastaControle 'logs'
     $pastaDownloads = Join-Path $Saida '_downloads'
@@ -2621,6 +3136,8 @@ try {
     $Script:ArquivoLog = Join-Path $pastaLogs ('execucao_{0}_{1}.log' -f $UF, $Script:Inicio.ToString('yyyyMMdd_HHmmss'))
 
     Write-Log ('pipeline_rais_caged.ps1 v{0} | PowerShell {1} ({2}) | {3}' -f $Script:VersaoScript, $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, [System.Environment]::OSVersion.VersionString)
+    # Uma execução por pasta (a simulação -SomenteListar não grava nada e dispensa a trava).
+    if (-not $SomenteListar) { $Script:Trava = Lock-PastaSaida -PastaControle $pastaControle -Saida $Saida }
     $grupos = @(Resolve-Grupos -Bases $Bases)
     Write-Log ('UF {0} ({1}) | {2}-{3} | grupos: {4} | saída: {5}' -f $UF, $Script:CodigoUF[$UF], $AnoInicial, $AnoFinal, ($grupos -join ', '), $Saida)
 
@@ -2659,16 +3176,32 @@ try {
         ManterBrutos = [bool]$ManterValoresBrutos; Gzip = [bool]$CompactarSaida; Bom = (-not [bool]$SemBOM)
         Motor = $motorEfetivo; SeteZip = $null; Tentativas = $Tentativas; UsarProxy = [bool]$UsarProxySistema
         ManterCompactados = [bool]$ManterCompactados; Paralelismo = $Paralelismo; Reprocessar = [bool]$Reprocessar
-        Grupos = $Script:MetaGrupos; Assinatura = $assinatura
+        Grupos = $Script:MetaGrupos; Assinatura = $assinatura; NamespaceMotor = $Script:NamespaceMotor
     }
     $defs = Initialize-Definicoes -MetaGrupos $Script:MetaGrupos
+    if ($null -ne $Script:Trava) { Clear-TemporariosOrfaos -Cfg $cfg -PastaControle $pastaControle }
 
     # Manifesto e descoberta.
     $caminhoManifesto = Join-Path $pastaControle ('manifesto_{0}.csv' -f $UF)
     $manifesto = Import-Manifesto -Caminho $caminhoManifesto
+    # Pasta movida/renomeada, outra letra de unidade ou UNC: os caminhos de saída passam a apontar para a atual.
+    $rebaseados = Update-CaminhosManifesto -Manifesto $manifesto -Cfg $cfg
+    if ($rebaseados -gt 0) {
+        Write-Log ('Manifesto: {0} caminho(s) de saída atualizado(s) para a pasta {1}.' -f $rebaseados, $Saida)
+        $Script:ManifestoAlterado = $true
+    }
+    if ($Script:ManifestoAlterado -and -not $SomenteListar) {
+        if (Save-ManifestoSeguro -Manifesto $manifesto -Caminho $caminhoManifesto) { $Script:ManifestoAlterado = $false }
+    }
     $extensao = '.csv'
     if ($cfg.Gzip) { $extensao = '.csv.gz' }
+    if ($cfg.UsarProxy -and $PSVersionTable.PSVersion.Major -ge 6) {
+        Write-Log '-UsarProxySistema não tem efeito no PowerShell 7+: o .NET atual não usa proxy em FTP (a conexão é direta).' 'AVISO'
+    }
     $itens = @(Get-ItensRemotos -Cfg $cfg -Grupos $grupos)
+    if ($cfg.UsarProxy -and @($itens | Where-Object { $_.Tamanho -le 0 }).Count -gt 0) {
+        Write-Log 'Modo proxy: o FTP não informou tamanho/data. Republicações do MTE NÃO são detectadas e o download não é conferido pelo tamanho; rode com -Reprocessar de tempos em tempos.' 'AVISO'
+    }
     foreach ($it in $itens) {
         $meta = $Script:MetaGrupos[$it.Grupo]
         $nome = '{0}_{1}_{2}' -f $meta.Prefixo, $UF, $it.Periodo
@@ -2711,16 +3244,21 @@ try {
             catch { }
 
             $resultados = @(Invoke-Execucao -Itens $aProcessar -Cfg $cfg -Defs $defs -Manifesto $manifesto -CaminhoManifesto $caminhoManifesto)
-            Export-Mapeamento -Caminho (Join-Path $pastaControle ('mapeamento_cabecalhos_{0}.csv' -f $UF)) -Resultados $resultados
             if (@($resultados | Where-Object { $_.Resultado.status -eq 'ERRO' }).Count -gt 0) { $codigoSaida = 1 }
+            # Cada etapa de pós-processamento é independente: um arquivo de controle aberto no Excel não pode
+            # impedir as demais nem transformar uma execução bem-sucedida em falha geral.
+            try { Export-Mapeamento -Caminho (Join-Path $pastaControle ('mapeamento_cabecalhos_{0}.csv' -f $UF)) -Resultados $resultados }
+            catch { Write-Log ('Mapeamento de cabeçalhos não gravado: {0}' -f $_.Exception.Message) 'ERRO'; $codigoSaida = 1 }
         }
         else {
             Write-Log 'Tudo em dia: nenhum arquivo novo, republicado ou pendente.' 'OK'
         }
 
-        Export-Dicionario -Caminho (Join-Path $pastaControle 'dicionario_colunas.csv') -Grupos $grupos -Defs $defs
+        try { Export-Dicionario -Caminho (Join-Path $pastaControle 'dicionario_colunas.csv') -Grupos $grupos -Defs $defs }
+        catch { Write-Log ('Dicionário de colunas não atualizado (aberto em outro programa?): {0}' -f $_.Exception.Message) 'AVISO' }
         if ($Cabecalho -ne 'Original') {
-            Export-DdlSqlServer -Caminho (Join-Path $pastaControle ('ddl_sqlserver_{0}.sql' -f $UF)) -Grupos $grupos -Defs $defs -Cfg $cfg
+            try { Export-DdlSqlServer -Caminho (Join-Path $pastaControle ('ddl_sqlserver_{0}.sql' -f $UF)) -Grupos $grupos -Defs $defs -Cfg $cfg }
+            catch { Write-Log ('DDL do SQL Server não atualizada (aberta em outro programa?): {0}' -f $_.Exception.Message) 'AVISO' }
         }
         if ($Consolidar) {
             if ($Cabecalho -eq 'Original') {
@@ -2733,15 +3271,31 @@ try {
                 }
             }
         }
-        Write-Resumo -Manifesto $manifesto -Grupos $grupos
+        try { Write-Resumo -Manifesto $manifesto -Grupos $grupos }
+        catch { Write-Log ('Resumo não gerado: {0}' -f $_.Exception.Message) 'AVISO' }
     }
+    if ($codigoSaida -eq 0 -and ($Script:ListagemIncompleta -or $Script:ErroControle)) { $codigoSaida = 1 }
+    if ($Script:ListagemIncompleta) { Write-Log 'Alguma pasta do FTP não pôde ser listada (veja os ERROs acima); os arquivos dela ficam para a próxima execução.' 'AVISO' }
     $duracao = (Get-Date) - $Script:Inicio
     Write-Log ('Fim. Duração: {0:hh\:mm\:ss}. Manifesto: {1}' -f $duracao, $caminhoManifesto) 'OK'
+    $terminou = $true
 }
 catch {
+    $terminou = $true
     $codigoSaida = 2
     $mensagemFalha = $_.Exception.Message
     try { Write-Log ('FALHA: {0}' -f $mensagemFalha) 'ERRO' } catch { Write-Host ('FALHA: {0}' -f $mensagemFalha) -ForegroundColor Red }
+}
+finally {
+    if ($null -ne $Script:Trava) { try { $Script:Trava.Dispose() } catch { } ; $Script:Trava = $null }
+    if (-not $terminou) {
+        # Ctrl+C: o PowerShell para o pipeline, o catch não roda e o "exit" abaixo não é alcançado (o processo
+        # sairia com 0, como se tudo tivesse dado certo). Registra e força o código 2 quando o processo foi
+        # aberto só para o script (Agendador/-File); num console interativo apenas registra.
+        try { Write-Log 'Execução interrompida (Ctrl+C) antes do fim; código de saída 2.' 'ERRO' } catch { }
+        try { if (Test-ProcessoDedicado) { $Host.SetShouldExit(2) } } catch { }
+        exit 2
+    }
 }
 exit $codigoSaida
 
