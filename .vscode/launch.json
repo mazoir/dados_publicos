@@ -1,0 +1,43 @@
+{
+    // Depuração com a extensão PowerShell (F5 ou Run and Debug). Cada sessão abre um terminal temporário da
+    // extensão, onde aparecem o log e as barras de progresso. Para só rodar, prefira as tarefas (tasks.json).
+    // Guia: docs/rais_caged_mg.md, seção 16.
+    "version": "0.2.0",
+    "inputs": [
+        {
+            "id": "argumentos",
+            "type": "promptString",
+            "description": "Parâmetros do pipeline_rais_caged.ps1 (ex.: -Saida 'D:\\MTE' -Bases CAGED_MOV -AnoInicial 2024 -Consolidar)",
+            "default": "-SomenteListar"
+        }
+    ],
+    "configurations": [
+        {
+            "name": "MTE: simulação (-SomenteListar)",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${workspaceFolder}/pipeline_rais_caged.ps1",
+            "args": ["-SomenteListar"],
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        },
+        {
+            "name": "MTE: teste rápido (CAGED exclusões de 2025, pasta de teste)",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${workspaceFolder}/pipeline_rais_caged.ps1",
+            "args": ["-Bases", "CAGED_EXC", "-AnoInicial", "2025", "-AnoFinal", "2025", "-Saida", "'${env:USERPROFILE}\\Dados\\MTE_teste'"],
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        },
+        {
+            "name": "MTE: com os parâmetros que eu digitar",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${workspaceFolder}/pipeline_rais_caged.ps1",
+            "args": ["${input:argumentos}"],
+            "cwd": "${workspaceFolder}",
+            "createTemporaryIntegratedConsole": true
+        }
+    ]
+}

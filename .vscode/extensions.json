@@ -1,0 +1,9 @@
+{
+    // O VS Code oferece instalar estas extensões ao abrir a pasta.
+    "recommendations": [
+        // Editar, rodar e depurar PowerShell (F5, terminal da extensão, análise do script).
+        "ms-vscode.powershell",
+        // Ver os CSVs de saída com as colunas alinhadas e coloridas.
+        "mechatroner.rainbow-csv"
+    ]
+}

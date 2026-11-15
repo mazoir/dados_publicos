@@ -33,6 +33,11 @@
                      com contagens e métricas de conferência, dicionário de colunas, mapeamento de
                      cabeçalhos, DDL para SQL Server e consolidação opcional por base.
 
+    PROGRESSO: barras na janela do PowerShell com a etapa atual (listagem do FTP, download e ETL,
+    consolidação), o percentual geral (ponderado pelo tamanho dos arquivos), a velocidade, o tempo restante
+    estimado e uma barra por arquivo em andamento (download ou ETL, com linhas por segundo). A cada
+    -IntervaloProgresso segundos, uma linha "Progresso:" com o mesmo resumo vai também para o log.
+
     Execuções seguintes são INCREMENTAIS: só processa o que é novo, foi republicado pelo MTE, teve a
     saída apagada ou foi gerado com outra configuração (delimitador, cabeçalho, decimal etc.).
     A pasta de saída pode ser movida ou acessada por outra letra de unidade/caminho UNC: os caminhos
@@ -114,6 +119,10 @@
 .PARAMETER Tentativas
     Tentativas por download/listagem antes de desistir. Padrão 5.
 
+.PARAMETER IntervaloProgresso
+    Segundos entre as linhas "Progresso:" gravadas no log e no console (padrão 60; 0 desliga). A barra de
+    progresso da janela é atualizada a cada segundo, qualquer que seja este valor.
+
 .PARAMETER SomenteListar
     Só mostra o que existe no FTP e o que seria baixado/processado (simulação), sem baixar nada.
 
@@ -133,7 +142,7 @@
     Execução agendada (Agendador de Tarefas), saída compactada.
 
 .NOTES
-    Versão ...... 1.1.0
+    Versão ...... 1.2.0
     Requisitos .. PowerShell 5.1+ (.NET Framework 4.5+) ou PowerShell 7+; 7-Zip (ou -Baixar7Zip);
                   saída liberada para ftp.mtps.gov.br (porta 21 + portas passivas); modo FullLanguage.
     Encoding .... Este arquivo é UTF-8 COM BOM (obrigatório para o Windows PowerShell 5.1 ler os acentos).
@@ -148,8 +157,9 @@
     se continuar bloqueado, fica o .pendente.csv (código 1), incorporado sozinho na execução seguinte.
     Feche esses arquivos SEM salvar: salvos pelo Excel, mudam de formato (encoding, separador) e
     ficam mais novos que o .pendente.csv, que deixa de ser incorporado.
-    Atualização do script: quando a versão do layout de saída muda (1.1.0 = layout 2), cada arquivo é
-    reprocessado (e baixado de novo, se não estiver em _downloads) na primeira execução que o cobre.
+    Atualização do script: quando a versão do layout de saída muda (desde a 1.1.0 = layout 2), cada
+    arquivo é reprocessado (e baixado de novo, se não estiver em _downloads) na primeira execução que
+    o cobre.
     Períodos e bases fora dessa execução ficam no layout antigo e, até lá, o -Consolidar recusa o
     grupo (código 1): rode uma vez com o período completo (-AnoInicial 2020).
 #>
@@ -204,6 +214,9 @@ param(
     [ValidateRange(1, 20)]
     [int]$Tentativas = 5,
 
+    [ValidateRange(0, 3600)]
+    [int]$IntervaloProgresso = 60,
+
     [switch]$SomenteListar
 )
 
@@ -212,7 +225,7 @@ $ErrorActionPreference = 'Stop'
 
 #region ============================ 1. CONFIGURAÇÃO ESTÁTICA ============================
 
-$Script:VersaoScript = '1.1.0'
+$Script:VersaoScript = '1.2.0'
 # Versão do layout de saída (entra na assinatura do manifesto): mudar este valor força o reprocessamento de
 # tudo e impede o -Consolidar de misturar saídas antigas e novas. Mude-o ao alterar o dicionário OU qualquer
 # regra de leitura/normalização que mude o conteúdo gerado para a mesma entrada.
@@ -417,7 +430,8 @@ $Script:FuncoesWorker = @(
     'Get-EntradasArquivo', 'Test-ArquivoIntegro', 'Read-AmostraEntrada', 'Get-EncodingAmostra', 'Get-CabecalhoAmostra',
     'Get-DelimitadorCabecalho', 'ConvertFrom-LinhaCsv', 'Remove-Acentos', 'ConvertTo-ChaveCabecalho',
     'ConvertTo-Slug', 'New-PlanoEtl', 'ConvertTo-PlanoCSharp', 'Get-MunicipioIbge7', 'New-EscritorCsv',
-    'ConvertTo-LinhaCsvSaida', 'Invoke-MotorPowerShell', 'Invoke-EtlArquivo', 'Invoke-ProcessarItem'
+    'ConvertTo-LinhaCsvSaida', 'Invoke-MotorPowerShell', 'Invoke-EtlArquivo', 'Invoke-ProcessarItem',
+    'Get-StreamComContador'
 )
 
 #endregion
@@ -1029,6 +1043,71 @@ namespace EtlMteV2
 }
 '@
 
+# Contador de bytes lidos do arquivo descompactado: só alimenta a barra de progresso do ETL. Fica FORA do
+# motor de propósito: o motor (e portanto a saída) não muda, e a carga funciona igual se este tipo não
+# compilar (a barra mostra só as linhas lidas). Mesma regra do motor: ao alterar este código, troque o sufixo
+# do namespace (EtlMteProgresso1 -> EtlMteProgresso2) aqui E em $Script:TipoContador.
+$Script:TipoContador = 'EtlMteProgresso1.ContadorStream'
+$Script:CodigoContador = @'
+using System;
+using System.IO;
+using System.Threading;
+
+namespace EtlMteProgresso1
+{
+    // Repassa a leitura ao stream original e conta os bytes (leitura segura de outra thread).
+    public sealed class ContadorStream : Stream
+    {
+        private readonly Stream _base;
+        private long _lidos;
+
+        public ContadorStream(Stream baseStream)
+        {
+            if (baseStream == null) throw new ArgumentNullException("baseStream");
+            _base = baseStream;
+        }
+
+        public long BytesLidos { get { return Interlocked.Read(ref _lidos); } }
+
+        public override bool CanRead { get { return _base.CanRead; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new NotSupportedException(); } }
+        public override long Position
+        {
+            get { return Interlocked.Read(ref _lidos); }
+            set { throw new NotSupportedException(); }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int n = _base.Read(buffer, offset, count);
+            if (n > 0) Interlocked.Add(ref _lidos, n);
+            return n;
+        }
+
+        public override int ReadByte()
+        {
+            int b = _base.ReadByte();
+            if (b >= 0) Interlocked.Increment(ref _lidos);
+            return b;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+
+        // Fechar o contador fecha o stream original, como acontecia antes sem ele.
+        protected override void Dispose(bool disposing)
+        {
+            try { if (disposing) _base.Dispose(); }
+            finally { base.Dispose(disposing); }
+        }
+    }
+}
+'@
+
 #endregion
 
 #region ============================ 3. FUNÇÕES UTILITÁRIAS ============================
@@ -1298,6 +1377,10 @@ function Invoke-FtpDownload {
         }
     }
     $ultimo = $null
+    # Bytes recebidos nesta execução, somados entre tentativas (barra de progresso).
+    $transfBase = [long]0
+    if ($null -ne $EstadoItem -and $null -ne $EstadoItem.Transferidos) { $transfBase = [long]$EstadoItem.Transferidos }
+    $transf = [long]0
     for ($t = 1; $t -le $Tentativas; $t++) {
         if ($null -ne $Controle -and $Controle.Cancelar) { throw 'Cancelado pelo usuário.' }
         $resp = $null; $rs = $null; $fs = $null
@@ -1325,23 +1408,25 @@ function Invoke-FtpDownload {
             $buf = New-Object byte[] 1048576
             $total = $offset
             $marca = [DateTime]::UtcNow
+            if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total }
             while (($lidos = $rs.Read($buf, 0, $buf.Length)) -gt 0) {
                 $fs.Write($buf, 0, $lidos)
                 $total += $lidos
+                $transf += $lidos
                 if ($TamanhoEsperado -gt 0 -and $total -gt $TamanhoEsperado) {
                     # Maior que o listado: o arquivo mudou no FTP depois da listagem. Repetir só baixaria tudo de novo.
                     throw ('REPUBLICADO_DURANTE_DOWNLOAD: o arquivo no FTP passou do tamanho listado ({0}); provável republicação durante a execução. Ele será baixado na próxima execução.' -f (Format-BytesLocal $TamanhoEsperado))
                 }
                 if (([DateTime]::UtcNow - $marca).TotalMilliseconds -ge 500) {
                     $marca = [DateTime]::UtcNow
-                    if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total }
+                    if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total; $EstadoItem.Transferidos = $transfBase + $transf }
                     if ($null -ne $Controle -and $Controle.Cancelar) { throw 'Cancelado pelo usuário.' }
                 }
             }
             $fs.Dispose(); $fs = $null
             $rs.Dispose(); $rs = $null
             $resp.Close(); $resp = $null
-            if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total }
+            if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total; $EstadoItem.Transferidos = $transfBase + $transf }
             $tam = (Get-Item -LiteralPath $part).Length
             if ($TamanhoEsperado -gt 0 -and $tam -ne $TamanhoEsperado) {
                 if ($tam -gt $TamanhoEsperado) { Remove-Item -LiteralPath $part -Force }
@@ -2042,11 +2127,31 @@ function Invoke-MotorPowerShell {
 
 #region ============================ 8. PROCESSAMENTO DE UM ARQUIVO (WORKER) ============================
 
+function Get-StreamComContador {
+    <#
+        Envolve o stream de uma entrada no contador de bytes da barra de progresso (o conteúdo lido não muda).
+        Sem o contador compilado (motor PowerShell ou compilação indisponível), devolve o próprio stream.
+    #>
+    param([System.IO.Stream]$Stream, [hashtable]$Cfg, $Est)
+    if ($null -eq $Est -or -not $Cfg.TipoContador) { return $Stream }
+    try {
+        $contador = New-Object -TypeName $Cfg.TipoContador -ArgumentList (, $Stream)
+        $Est.Contador = $contador
+        return $contador
+    }
+    catch { return $Stream }
+}
+
 function Invoke-EtlArquivo {
     <# Abre cada entrada do arquivo compactado, monta o plano pelo cabeçalho e executa o motor escolhido. #>
     param([string]$Arquivo, $Item, [hashtable]$Cfg, [hashtable]$Defs, $Est, $Controle, [string]$Tmp, $Fila)
     $meta = $Cfg.Grupos[$Item.Grupo]
     $entradas = @(Get-EntradasArquivo -Arquivo $Arquivo -SeteZip $Cfg.SeteZip)
+    # Barra de progresso do ETL: bytes descompactados lidos / tamanho descompactado informado pelo 7-Zip.
+    $Est.Contador = $null
+    $Est.EtlBase = [long]0
+    $Est.EtlTotal = [long]0
+    foreach ($ent in $entradas) { $Est.EtlTotal = [long]$Est.EtlTotal + [long]$ent.Tamanho }
     $resultado = @{
         LinhasLidas = [long]0; LinhasSaida = [long]0; LinhasIrregulares = [long]0
         MetricaSoma = [decimal]0; MetricaPositivos = [long]0; MetricaNegativos = [long]0
@@ -2063,7 +2168,11 @@ function Invoke-EtlArquivo {
     try {
         foreach ($ent in $entradas) {
             $amostra = Read-AmostraEntrada -Arquivo $Arquivo -Entrada $ent -SeteZip $Cfg.SeteZip
-            if ($amostra.Length -eq 0) { $resultado.Avisos.Add(('Entrada vazia: {0}' -f $ent.Nome)); continue }
+            if ($amostra.Length -eq 0) {
+                $resultado.Avisos.Add(('Entrada vazia: {0}' -f $ent.Nome))
+                $Est.EtlBase = [long]$Est.EtlBase + [long]$ent.Tamanho
+                continue
+            }
             $enc = Get-EncodingAmostra -Bytes $amostra -Padrao $meta.EncodingPadrao
             $linhaCab = Get-CabecalhoAmostra -Bytes $amostra -NomeEncoding $enc -AmostraCompleta ($amostra.Length -lt 262144)
             $delim = Get-DelimitadorCabecalho -Linha $linhaCab
@@ -2097,8 +2206,9 @@ function Invoke-EtlArquivo {
                 try {
                     $s = $zip.GetEntry($ent.Nome).Open()
                     try {
-                        if ($null -ne $proc) { $proc.ProcessarStream($s, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
-                        else { Invoke-MotorPowerShell -Plano $plano -Entrada $s -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
+                        $entrada = Get-StreamComContador -Stream $s -Cfg $Cfg -Est $Est
+                        if ($null -ne $proc) { $proc.ProcessarStream($entrada, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
+                        else { Invoke-MotorPowerShell -Plano $plano -Entrada $entrada -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
                     }
                     finally { $s.Dispose() }
                 }
@@ -2110,8 +2220,9 @@ function Invoke-EtlArquivo {
                 $tErr = $p.StandardError.ReadToEndAsync()
                 $ok = $false
                 try {
-                    if ($null -ne $proc) { $proc.ProcessarStream($p.StandardOutput.BaseStream, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
-                    else { Invoke-MotorPowerShell -Plano $plano -Entrada $p.StandardOutput.BaseStream -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
+                    $entrada = Get-StreamComContador -Stream $p.StandardOutput.BaseStream -Cfg $Cfg -Est $Est
+                    if ($null -ne $proc) { $proc.ProcessarStream($entrada, $enc, (ConvertTo-PlanoCSharp -Plano $plano -Namespace $Cfg.NamespaceMotor)) }
+                    else { Invoke-MotorPowerShell -Plano $plano -Entrada $entrada -NomeEncoding $enc -Escritor $w -Resultado $resultado -DelimitadorSaida ([char]$Cfg.DelimitadorSaida) -EstadoItem $Est -Controle $Controle }
                     $ok = $true
                 }
                 finally {
@@ -2125,6 +2236,9 @@ function Invoke-EtlArquivo {
                 if ($codigo -ge 2) { throw ('ARQUIVO_CORROMPIDO: 7-Zip retornou código {0} ao extrair {1}: {2}' -f $codigo, $ent.Nome, $erro7z.Trim()) }
                 if ($codigo -eq 1) { $resultado.Avisos.Add(('7-Zip emitiu aviso ao extrair {0}: {1}' -f $ent.Nome, $erro7z.Trim())) }
             }
+            # Entrada concluída (barra de progresso): a próxima conta a partir do total das anteriores.
+            $Est.Contador = $null
+            $Est.EtlBase = [long]$Est.EtlBase + [long]$ent.Tamanho
         }
         if ($null -eq $cabecalhoRef) { throw 'O arquivo compactado não contém dados.' }
         if ($null -ne $proc) {
@@ -2145,6 +2259,7 @@ function Invoke-EtlArquivo {
         if ($null -ne $proc) { $proc.Dispose() }
         if ($null -ne $w) { $w.Dispose() }
         $Est.Processador = $null
+        $Est.Contador = $null
     }
     $resultado.Encoding = (@($encs | Select-Object -Unique) -join ',')
     $resultado.Delimitador = (@($delims | Select-Object -Unique) -join ',')
@@ -2158,7 +2273,12 @@ function Invoke-ProcessarItem {
     param($Item, [hashtable]$Cfg, [hashtable]$Defs, $Fila, $Estado, $Controle)
     $inicio = Get-Date
     $id = $Item.Id
-    $est = @{ Fase = 'Aguardando'; Bytes = [long]0; Total = [long]$Item.Tamanho; Linhas = [long]0; Processador = $null; Processo = $null }
+    # Estado lido pela barra de progresso (thread principal): fase, bytes baixados (Bytes inclui o que já estava
+    # no .part; Transferidos, só o desta execução), linhas e bytes descompactados lidos no ETL.
+    $est = @{
+        Fase = 'Aguardando'; Bytes = [long]0; Total = [long]$Item.Tamanho; Transferidos = [long]0; Linhas = [long]0
+        Processador = $null; Processo = $null; Contador = $null; EtlBase = [long]0; EtlTotal = [long]0
+    }
     $Estado[$id] = $est
     $meta = $Cfg.Grupos[$Item.Grupo]
     $tmp = $Item.CaminhoSaida + '.tmp'
@@ -2339,22 +2459,41 @@ function Resolve-Grupos {
 
 function Get-ItensRemotos {
     <# Percorre o FTP e devolve um item por arquivo compactado do período/grupos selecionados. #>
-    param([hashtable]$Cfg, [string[]]$Grupos)
+    param([hashtable]$Cfg, [string[]]$Grupos, [string]$Rotulo = 'Listagem do FTP')
     $itens = New-Object System.Collections.Generic.List[object]
     $querRais = @($Grupos | Where-Object { $_ -like 'RAIS_*' }).Count -gt 0
     $querCaged = @($Grupos | Where-Object { $_ -like 'CAGED_*' }).Count -gt 0
     $regiaoAlvo = ($Cfg.RegiaoUF -replace '[^A-Z]', '')
+    # Barra da listagem: cada pasta de ano (RAIS e CAGED) vale uma unidade; os meses do CAGED dividem a do ano.
+    $anosPeriodo = [math]::Max(1, $Cfg.AnoFinal - $Cfg.AnoInicial + 1)
+    $prog = @{ Unidades = [double]0; Feitas = [double]0; Pastas = 0 }
+    if ($querRais) { $prog.Unidades += $anosPeriodo }
+    if ($querCaged) { $prog.Unidades += $anosPeriodo }
+    $mostrar = {
+        param([string]$Pasta)
+        $txt = '{0} | {1} pasta(s) listada(s) | {2} arquivo(s) do período' -f $Pasta, $prog.Pastas, $itens.Count
+        Write-ProgressoEtapa -Atividade $Rotulo -Status $txt -Fracao ($prog.Feitas / [math]::Max(1, $prog.Unidades))
+    }
 
     if ($querRais) {
         $urlRais = Join-FtpUrl -Base $Cfg.FtpBase -Segmentos @('RAIS')
         Write-Log ('Listando {0}' -f $urlRais)
+        & $mostrar 'RAIS'
         $anos = @(Get-FtpListagem -Url $urlRais -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object {
                 $_.EhDiretorio -and $_.Nome -match '^\d{4}$' -and [int]$_.Nome -ge $Cfg.AnoInicial -and [int]$_.Nome -le $Cfg.AnoFinal
             } | Sort-Object Nome)
+        $prog.Pastas++
+        # Unidades da RAIS = anos que existem no FTP (o ano corrente costuma não existir ainda).
+        $prog.Unidades = [double]$prog.Unidades - $anosPeriodo + [math]::Max(1, $anos.Count)
+        $k = 0
         foreach ($a in $anos) {
+            $k++
+            & $mostrar ('RAIS/{0} (ano {1} de {2})' -f $a.Nome, $k, $anos.Count)
             # Uma pasta de ano que não pode ser listada não derruba as demais (a raiz continua obrigatória).
             try { $arquivos = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio }) }
-            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; continue }
+            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; $prog.Feitas++; continue }
+            $prog.Pastas++
+            $prog.Feitas++
             foreach ($f in $arquivos) {
                 $grupo = $null; $regiao = ''
                 if (($Grupos -contains 'RAIS_VINC') -and $f.Nome -match '^RAIS_VINC_PUB_(?<reg>.+?)\.(7z|zip)$') {
@@ -2379,21 +2518,38 @@ function Get-ItensRemotos {
     if ($querCaged) {
         $urlCaged = Join-FtpUrl -Base $Cfg.FtpBase -Segmentos @('NOVO CAGED')
         Write-Log ('Listando {0}' -f $urlCaged)
+        & $mostrar 'NOVO CAGED'
         $anos = @(Get-FtpListagem -Url $urlCaged -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object {
                 $_.EhDiretorio -and $_.Nome -match '^\d{4}$' -and [int]$_.Nome -ge $Cfg.AnoInicial -and [int]$_.Nome -le $Cfg.AnoFinal
             } | Sort-Object Nome)
+        $prog.Pastas++
+        $prog.Unidades = [double]$prog.Unidades - $anosPeriodo + [math]::Max(1, $anos.Count)
         $mapaTipo = @{ MOV = 'CAGED_MOV'; FOR = 'CAGED_FOR'; EXC = 'CAGED_EXC' }
+        $k = 0
         foreach ($a in $anos) {
+            $k++
+            $inicioAno = [double]$prog.Feitas
+            & $mostrar ('NOVO CAGED/{0} (ano {1} de {2})' -f $a.Nome, $k, $anos.Count)
             try { $conteudo = @(Get-FtpListagem -Url $a.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas) }
-            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; continue }
+            catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true; $prog.Feitas = $inicioAno + 1; continue }
+            $prog.Pastas++
+            $meses = @($conteudo | Where-Object { $_.EhDiretorio -and $_.Nome -match '^\d{6}$' -and $_.Nome.StartsWith($a.Nome) })
+            $m = 0
             $arquivos = New-Object System.Collections.Generic.List[object]
             foreach ($e in $conteudo) {
                 if (-not $e.EhDiretorio) { $arquivos.Add($e) }
                 elseif ($e.Nome -match '^\d{6}$' -and $e.Nome.StartsWith($a.Nome)) {
-                    try { foreach ($x in @(Get-FtpListagem -Url $e.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio })) { $arquivos.Add($x) } }
+                    $m++
+                    & $mostrar ('NOVO CAGED/{0}/{1} (mês {2} de {3})' -f $a.Nome, $e.Nome, $m, $meses.Count)
+                    try {
+                        foreach ($x in @(Get-FtpListagem -Url $e.Url -UsarProxy $Cfg.UsarProxy -Tentativas $Cfg.Tentativas | Where-Object { -not $_.EhDiretorio })) { $arquivos.Add($x) }
+                        $prog.Pastas++
+                    }
                     catch { Write-Log ('Pasta ignorada nesta execução: {0}' -f $_.Exception.Message) 'ERRO'; $Script:ListagemIncompleta = $true }
+                    $prog.Feitas = $inicioAno + ($m / [math]::Max(1, $meses.Count))
                 }
             }
+            $prog.Feitas = $inicioAno + 1
             foreach ($f in $arquivos) {
                 if ($f.Nome -notmatch '^CAGED(?<tipo>MOV|FOR|EXC)(?<per>\d{6})\.(7z|zip)$') { continue }
                 $grupo = $mapaTipo[$Matches['tipo'].ToUpperInvariant()]
@@ -2811,6 +2967,24 @@ function Initialize-MotorCSharp {
     }
 }
 
+function Initialize-ContadorProgresso {
+    <#
+        Compila o contador de bytes da barra de progresso do ETL (uma vez por console). Devolve o nome do tipo
+        ou '' se não for possível: nesse caso a barra mostra só as linhas lidas, e a carga segue igual.
+    #>
+    if ($Script:CodigoContador -notmatch ('(?m)^namespace {0}\s*$' -f [regex]::Escape(($Script:TipoContador -replace '\.[^.]+$', '')))) {
+        Write-Verbose 'O namespace do contador de progresso não confere com $Script:TipoContador.'
+        return ''
+    }
+    if ($Script:TipoContador -as [type]) { return $Script:TipoContador }
+    try {
+        Add-Type -TypeDefinition $Script:CodigoContador -Language CSharp -ErrorAction Stop
+        if ($Script:TipoContador -as [type]) { return $Script:TipoContador }
+    }
+    catch { Write-Verbose ('Contador de progresso indisponível: {0}' -f $_.Exception.Message) }
+    return ''
+}
+
 #endregion
 
 #region ============================ 11. EXECUÇÃO PARALELA ============================
@@ -2828,8 +3002,304 @@ function Get-ChavesEstado {
     return , $chaves
 }
 
+#region --- Barra de progresso (thread principal; tudo aqui é cosmético e nunca interrompe a execução) ---
+
+function Format-Duracao {
+    <# Duração legível: 40 -> '40 s'; 95 -> '1 min 35 s'; 3725 -> '1 h 02 min'. #>
+    param([double]$Segundos)
+    if ([double]::IsNaN($Segundos) -or [double]::IsInfinity($Segundos) -or $Segundos -lt 0) { return '?' }
+    $s = [long][math]::Round($Segundos)
+    if ($s -lt 60) { return ('{0} s' -f $s) }
+    if ($s -lt 3600) { return ('{0} min {1:00} s' -f [long][math]::Floor($s / 60), ($s % 60)) }
+    return ('{0} h {1:00} min' -f [long][math]::Floor($s / 3600), [long][math]::Floor(($s % 3600) / 60))
+}
+
+function Write-ProgressoEtapa {
+    <#
+        Barra das etapas fora do download/ETL (listagem do FTP, consolidação). Fracao de 0 a 1; negativa quando
+        não há como estimar (a barra mostra só o texto).
+    #>
+    param([string]$Atividade, [string]$Status = '...', [double]$Fracao = -1, [switch]$Concluir)
+    try {
+        if ($Concluir) { Write-Progress -Id 1 -Activity $Atividade -Completed; return }
+        $pct = -1
+        if ($Fracao -ge 0) { $pct = [int][math]::Max(0, [math]::Min(100, [math]::Floor(100 * $Fracao))) }
+        if (-not $Status) { $Status = '...' }
+        Write-Progress -Id 1 -Activity $Atividade -Status $Status -PercentComplete $pct
+    }
+    catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
+}
+
+function New-PainelProgresso {
+    <#
+        Estado da barra do download/ETL. Cada arquivo pesa o seu tamanho no FTP (sem tamanho: a média dos
+        conhecidos), metade para o download e metade para o ETL.
+    #>
+    param([object[]]$Itens, [string]$Atividade, [int]$IntervaloTexto)
+    $conhecidos = @($Itens | Where-Object { [long]$_.Tamanho -gt 0 })
+    $padrao = [double]1MB
+    if ($conhecidos.Count -gt 0) { $padrao = [double]($conhecidos | Measure-Object -Property Tamanho -Average).Average }
+    $pesos = @{}
+    $soma = [double]0
+    foreach ($i in $Itens) {
+        $peso = [double]$i.Tamanho
+        if ($peso -le 0) { $peso = $padrao }
+        $pesos[[string]$i.Id] = $peso
+        $soma += $peso
+    }
+    return @{
+        Atividade = $Atividade; Inicio = [DateTime]::UtcNow; Total = @($Itens).Count
+        Pesos = $pesos; PesoTotal = [math]::Max([double]1, $soma); PesoConcluido = [double]0
+        Concluidos = 0; Erros = 0; Baixados = [double]0
+        Slots = @{}; Amostras = @{}; UltimoPai = $null; Retocado = $false
+        UltimaBarra = [DateTime]::MinValue; UltimoTexto = [DateTime]::UtcNow; IntervaloTexto = $IntervaloTexto
+    }
+}
+
+function Get-MediaMovel {
+    param([double]$Media, [double]$Valor)
+    if ($Media -le 0) { return $Valor }
+    return (0.7 * $Media + 0.3 * $Valor)
+}
+
+function Update-AmostraProgresso {
+    <# Lê o estado de um arquivo em andamento e atualiza as velocidades (média móvel entre leituras). #>
+    param([hashtable]$Painel, [string]$Id, [hashtable]$Est)
+    $agora = [DateTime]::UtcNow
+    $fase = [string]$Est.Fase
+    $bytes = [long]$Est.Bytes
+    $linhas = [long]$Est.Linhas
+    if ($null -ne $Est.Processador) { try { $linhas = [long]$Est.Processador.LinhasLidas } catch { } }
+    $etl = [long]-1
+    $contador = $Est.Contador
+    if ($null -ne $contador) { try { $etl = [long]$Est.EtlBase + [long]$contador.BytesLidos } catch { $etl = [long]-1 } }
+    $a = $Painel.Amostras[$Id]
+    if ($null -eq $a) {
+        $a = @{ T = $agora; Fase = $fase; Bytes = $bytes; Linhas = $linhas; Etl = $etl; VelDl = [double]0; VelLin = [double]0; VelEtl = [double]0; Transferidos = [long]0 }
+        $Painel.Amostras[$Id] = $a
+    }
+    else {
+        $dt = ($agora - $a.T).TotalSeconds
+        if ($dt -ge 0.5) {
+            if ($fase -eq 'Download' -and $a.Fase -eq 'Download' -and $bytes -ge $a.Bytes) {
+                $a.VelDl = Get-MediaMovel -Media $a.VelDl -Valor (($bytes - $a.Bytes) / $dt)
+            }
+            if ($fase -eq 'Processando' -and $a.Fase -eq 'Processando') {
+                if ($linhas -ge $a.Linhas) { $a.VelLin = Get-MediaMovel -Media $a.VelLin -Valor (($linhas - $a.Linhas) / $dt) }
+                if ($etl -ge 0 -and $a.Etl -ge 0 -and $etl -ge $a.Etl) { $a.VelEtl = Get-MediaMovel -Media $a.VelEtl -Valor (($etl - $a.Etl) / $dt) }
+            }
+            $a.T = $agora; $a.Fase = $fase; $a.Bytes = $bytes; $a.Linhas = $linhas; $a.Etl = $etl
+        }
+    }
+    $a.LinhasAgora = $linhas
+    $a.EtlAgora = $etl
+    if ($null -ne $Est.Transferidos) { $a.Transferidos = [long]$Est.Transferidos }
+    return $a
+}
+
+function Get-InfoItemProgresso {
+    <#
+        Fração do arquivo no total (download = 0 a 0,5; ETL = 0,5 a 1), percentual da fase atual (-1 = sem barra)
+        e textos da barra e da linha "Progresso:".
+    #>
+    param([hashtable]$Est, [hashtable]$Amostra)
+    $fase = [string]$Est.Fase
+    $info = @{ Fracao = [double]0; Pct = -1; Texto = 'aguardando'; Curto = 'aguardando' }
+    if ($fase -eq 'Download') {
+        $total = [long]$Est.Total
+        $bytes = [long]$Est.Bytes
+        if ($total -gt 0) {
+            $f = [math]::Min([double]1, $bytes / [double]$total)
+            $info.Fracao = 0.5 * $f
+            $info.Pct = [int][math]::Floor(100 * $f)
+            $txt = 'baixando {0}% | {1} de {2}' -f $info.Pct, (Format-Bytes $bytes), (Format-Bytes $total)
+            if ($Amostra.VelDl -gt 0) { $txt += (' | {0}/s | faltam ~{1}' -f (Format-Bytes $Amostra.VelDl), (Format-Duracao (($total - $bytes) / $Amostra.VelDl))) }
+            $info.Curto = 'baixando {0}%' -f $info.Pct
+        }
+        else {
+            $info.Fracao = 0.25
+            $txt = 'baixando {0} (tamanho desconhecido)' -f (Format-Bytes $bytes)
+            if ($Amostra.VelDl -gt 0) { $txt += (' | {0}/s' -f (Format-Bytes $Amostra.VelDl)) }
+            $info.Curto = 'baixando {0}' -f (Format-Bytes $bytes)
+        }
+        $info.Texto = $txt
+    }
+    elseif ($fase -eq 'Processando') {
+        $linhas = [long]$Amostra.LinhasAgora
+        $etl = [long]$Amostra.EtlAgora
+        $etlTotal = [long]$Est.EtlTotal
+        if ($etl -ge 0 -and $etlTotal -gt 0) {
+            $f = [math]::Min(0.99, $etl / [double]$etlTotal)
+            $info.Fracao = 0.5 + 0.5 * $f
+            $info.Pct = [int][math]::Floor(100 * $f)
+            $txt = 'processando {0}% | {1:N0} linhas' -f $info.Pct, $linhas
+            if ($Amostra.VelLin -gt 0) { $txt += (' | {0:N0} linhas/s' -f $Amostra.VelLin) }
+            if ($Amostra.VelEtl -gt 0) { $txt += (' | faltam ~{0}' -f (Format-Duracao (($etlTotal - $etl) / $Amostra.VelEtl))) }
+            $info.Curto = 'processando {0}%' -f $info.Pct
+        }
+        else {
+            # Sem o contador de bytes (motor PowerShell): só as linhas lidas.
+            $info.Fracao = 0.75
+            $txt = 'processando {0:N0} linhas' -f $linhas
+            if ($Amostra.VelLin -gt 0) { $txt += (' | {0:N0} linhas/s' -f $Amostra.VelLin) }
+            $info.Curto = 'processando {0:N0} linhas' -f $linhas
+        }
+        $info.Texto = $txt
+    }
+    elseif ($fase -eq 'Testando') {
+        $info.Fracao = 0.9
+        $info.Texto = 'testando a integridade do arquivo (7z t)'
+        $info.Curto = 'testando a integridade'
+    }
+    elseif ($fase -eq 'Concluído') {
+        $info.Fracao = [double]1
+        $info.Pct = 100
+        $info.Texto = 'gravando o resultado'
+        $info.Curto = 'concluído'
+    }
+    return $info
+}
+
+function Show-PainelProgresso {
+    <#
+        Barra geral do download/ETL (percentual ponderado pelo tamanho, velocidade, tempo restante) e, abaixo
+        dela, uma barra por arquivo em andamento. A cada IntervaloTexto segundos grava a linha "Progresso:".
+    #>
+    param([hashtable]$Painel, [hashtable]$Estado, [switch]$Forcar)
+    $agora = [DateTime]::UtcNow
+    $desde = ($agora - $Painel.UltimaBarra).TotalMilliseconds
+    if (-not $Forcar -and $desde -lt 1000) {
+        # O PowerShell 7 redesenha as barras no máximo a cada 200 ms: as barras dos arquivos gravadas logo depois
+        # da geral só apareceriam no ciclo seguinte. Repetir a geral ~300 ms depois mostra todas atualizadas.
+        if ($desde -ge 250 -and -not $Painel.Retocado -and $null -ne $Painel.UltimoPai) {
+            $Painel.Retocado = $true
+            try { Write-Progress -Id 1 -Activity $Painel.Atividade -Status $Painel.UltimoPai.Status -CurrentOperation $Painel.UltimoPai.Operacao -PercentComplete $Painel.UltimoPai.Pct }
+            catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
+        }
+        return
+    }
+    $Painel.UltimaBarra = $agora
+    $Painel.Retocado = $false
+    $ativos = New-Object System.Collections.Generic.List[object]
+    $pesoAndamento = [double]0
+    $velDl = [double]0
+    $baixadosAtivos = [double]0
+    foreach ($id in (Get-ChavesEstado -Estado $Estado)) {
+        $e = $Estado[$id]
+        if ($null -eq $e) { continue }
+        $a = Update-AmostraProgresso -Painel $Painel -Id ([string]$id) -Est $e
+        $info = Get-InfoItemProgresso -Est $e -Amostra $a
+        $peso = $Painel.Pesos[[string]$id]
+        if ($null -eq $peso) { $peso = [double]0 }
+        $pesoAndamento += [double]$peso * $info.Fracao
+        if ([string]$e.Fase -eq 'Download') { $velDl += $a.VelDl }
+        $baixadosAtivos += [double]$a.Transferidos
+        $ativos.Add([pscustomobject]@{ Id = [string]$id; Info = $info })
+    }
+    $fracao = [math]::Max([double]0, [math]::Min([double]1, ($Painel.PesoConcluido + $pesoAndamento) / $Painel.PesoTotal))
+    $pct = [int][math]::Floor(100 * $fracao)
+    $decorrido = ($agora - $Painel.Inicio).TotalSeconds
+    $restante = [double]-1
+    if ($fracao -ge 0.01 -and $decorrido -ge 5) { $restante = $decorrido * (1 - $fracao) / $fracao }
+    $baixados = $Painel.Baixados + $baixadosAtivos
+    $naFila = [math]::Max(0, $Painel.Total - $Painel.Concluidos - $ativos.Count)
+
+    $arquivos = '{0} de {1} arquivos' -f $Painel.Concluidos, $Painel.Total
+    if ($Painel.Erros -gt 0) { $arquivos += (' ({0} com erro)' -f $Painel.Erros) }
+    $partes = New-Object System.Collections.Generic.List[string]
+    $partes.Add(('{0}%' -f $pct))
+    $partes.Add($arquivos)
+    if ($velDl -gt 0) { $partes.Add(('{0}/s' -f (Format-Bytes $velDl))) }
+    if ($restante -ge 0) { $partes.Add(('faltam ~{0}' -f (Format-Duracao $restante))) }
+    else { $partes.Add('calculando o tempo restante') }
+    $status = $partes -join ' | '
+    $operacao = 'decorrido {0} | baixados {1} | {2} em andamento | {3} na fila' -f (Format-Duracao $decorrido), (Format-Bytes $baixados), $ativos.Count, $naFila
+
+    $Painel.UltimoPai = @{ Status = $status; Operacao = $operacao; Pct = $pct }
+    try {
+        Write-Progress -Id 1 -Activity $Painel.Atividade -Status $status -CurrentOperation $operacao -PercentComplete $pct
+        # Uma barra por arquivo em andamento; as posições (Id) são reaproveitadas quando um arquivo termina.
+        $vistos = @{}
+        foreach ($x in $ativos) {
+            if (-not $Painel.Slots.ContainsKey($x.Id)) {
+                $usados = @{}
+                foreach ($v in @($Painel.Slots.Values)) { $usados[[int]$v] = $true }
+                $slot = 1
+                while ($usados.ContainsKey($slot)) { $slot++ }
+                $Painel.Slots[$x.Id] = $slot
+            }
+            $vistos[$x.Id] = $true
+        }
+        foreach ($id in @($Painel.Slots.Keys)) {
+            if (-not $vistos.ContainsKey($id)) {
+                Write-Progress -Id (10 + [int]$Painel.Slots[$id]) -ParentId 1 -Activity $id -Completed
+                $Painel.Slots.Remove($id)
+            }
+        }
+        foreach ($x in @($ativos | Sort-Object -Property @{ Expression = { [int]$Painel.Slots[$_.Id] } })) {
+            Write-Progress -Id (10 + [int]$Painel.Slots[$x.Id]) -ParentId 1 -Activity $x.Id -Status $x.Info.Texto -PercentComplete $x.Info.Pct
+        }
+    }
+    catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
+
+    if ($Painel.IntervaloTexto -gt 0 -and ($agora - $Painel.UltimoTexto).TotalSeconds -ge $Painel.IntervaloTexto) {
+        $Painel.UltimoTexto = $agora
+        $txt = 'Progresso: {0} | baixados {1} | decorrido {2}' -f $status, (Format-Bytes $baixados), (Format-Duracao $decorrido)
+        $andamento = @($ativos | Select-Object -First 4 | ForEach-Object { '{0} {1}' -f $_.Id, $_.Info.Curto })
+        if ($andamento.Count -gt 0) { $txt += (' | em andamento: ' + ($andamento -join ', ')) }
+        if ($ativos.Count -gt 4) { $txt += (' e mais {0}' -f ($ativos.Count - 4)) }
+        Write-Log $txt
+    }
+}
+
+function Register-ItemConcluido {
+    <# Arquivo coletado: passa a contar inteiro no percentual e a barra dele sai da tela. #>
+    param([hashtable]$Painel, [string]$Id, $Est, [bool]$Erro)
+    $peso = $Painel.Pesos[$Id]
+    if ($null -ne $peso) { $Painel.PesoConcluido = [double]$Painel.PesoConcluido + [double]$peso }
+    $Painel.Concluidos = [int]$Painel.Concluidos + 1
+    if ($Erro) { $Painel.Erros = [int]$Painel.Erros + 1 }
+    $transferidos = [double]0
+    if ($null -ne $Est -and $null -ne $Est.Transferidos) { $transferidos = [double]$Est.Transferidos }
+    elseif ($Painel.Amostras.ContainsKey($Id)) { $transferidos = [double]$Painel.Amostras[$Id].Transferidos }
+    $Painel.Baixados = [double]$Painel.Baixados + $transferidos
+    $Painel.Amostras.Remove($Id)
+    if ($Painel.Slots.ContainsKey($Id)) {
+        try { Write-Progress -Id (10 + [int]$Painel.Slots[$Id]) -ParentId 1 -Activity $Id -Completed } catch { }
+        $Painel.Slots.Remove($Id)
+    }
+}
+
+function Write-ResumoPainel {
+    <# Linha final do download/ETL: tempo total, arquivos, erros e volume baixado. #>
+    param([hashtable]$Painel)
+    $decorrido = ([DateTime]::UtcNow - $Painel.Inicio).TotalSeconds
+    $txt = 'Download e ETL concluídos em {0}: {1} de {2} arquivos' -f (Format-Duracao $decorrido), $Painel.Concluidos, $Painel.Total
+    if ($Painel.Erros -gt 0) { $txt += (' ({0} com erro)' -f $Painel.Erros) }
+    $txt += ('; {0} baixados' -f (Format-Bytes $Painel.Baixados))
+    if ($decorrido -ge 1 -and $Painel.Baixados -gt 0) { $txt += (' ({0}/s em média)' -f (Format-Bytes ($Painel.Baixados / $decorrido))) }
+    $nivel = 'OK'
+    if ($Painel.Erros -gt 0) { $nivel = 'AVISO' }
+    Write-Log ($txt + '.') $nivel
+}
+
+function Complete-PainelProgresso {
+    <# Tira da tela as barras do download/ETL (fim normal ou interrupção). #>
+    param([hashtable]$Painel)
+    foreach ($id in @($Painel.Slots.Keys)) {
+        try { Write-Progress -Id (10 + [int]$Painel.Slots[$id]) -ParentId 1 -Activity $id -Completed } catch { }
+    }
+    $Painel.Slots.Clear()
+    try { Write-Progress -Id 1 -Activity $Painel.Atividade -Completed } catch { }
+}
+
+#endregion
+
 function Invoke-Execucao {
-    param([object[]]$Itens, [hashtable]$Cfg, [hashtable]$Defs, [hashtable]$Manifesto, [string]$CaminhoManifesto, [hashtable]$Mapa)
+    param(
+        [object[]]$Itens, [hashtable]$Cfg, [hashtable]$Defs, [hashtable]$Manifesto, [string]$CaminhoManifesto, [hashtable]$Mapa,
+        [string]$Atividade = 'Download e ETL', [int]$IntervaloProgresso = 60
+    )
     $fila = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
     $estado = [hashtable]::Synchronized(@{})
     $controle = [hashtable]::Synchronized(@{ Cancelar = $false })
@@ -2845,8 +3315,7 @@ function Invoke-Execucao {
     $tarefas = New-Object System.Collections.Generic.List[object]
     $concluidas = 0
     $total = $Itens.Count
-    $ultimoProgresso = [DateTime]::MinValue
-    $atividade = 'RAIS/CAGED - UF {0}' -f $Cfg.UF
+    $painel = New-PainelProgresso -Itens $Itens -Atividade $Atividade -IntervaloTexto $IntervaloProgresso
     $ondeManifesto = 'Principal'   # destino da última gravação do manifesto: Principal | Pendente | Nenhum
     try {
         foreach ($item in $Itens) {
@@ -2908,39 +3377,20 @@ function Invoke-Execucao {
                 }
                 $ondeManifesto = $g.Onde
                 $resultados.Add([pscustomobject]@{ Item = $t.Item; Resultado = $r })
+                # Barra de progresso é cosmética: nenhuma falha aqui pode interromper a execução.
+                try { Register-ItemConcluido -Painel $painel -Id $t.Item.Id -Est $estado[$t.Item.Id] -Erro ($r.status -eq 'ERRO') }
+                catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
                 $estado.Remove($t.Item.Id)
                 foreach ($a in @($r.Avisos)) { Write-Log -Mensagem $a -Nivel 'AVISO' -Id $t.Item.Id }
                 $nivel = 'OK'
                 if ($r.status -eq 'ERRO') { $nivel = 'ERRO' } elseif ($r.status -eq 'SEM_DADOS') { $nivel = 'AVISO' }
-                Write-Log -Mensagem ('{0} - {1}' -f $r.status, $r.mensagem) -Nivel $nivel -Id $t.Item.Id
+                Write-Log -Mensagem ('{0} - {1} [{2} de {3}]' -f $r.status, $r.mensagem, $concluidas, $total) -Nivel $nivel -Id $t.Item.Id
             }
-            if (([DateTime]::UtcNow - $ultimoProgresso).TotalMilliseconds -ge 1000) {
-                $ultimoProgresso = [DateTime]::UtcNow
-                # Barra de progresso é cosmética: nenhuma falha aqui pode interromper a execução.
-                try {
-                    $ativos = New-Object System.Collections.Generic.List[string]
-                    foreach ($chave in (Get-ChavesEstado -Estado $estado)) {
-                        $e = $estado[$chave]
-                        if ($null -eq $e) { continue }
-                        if ($e.Fase -eq 'Download') {
-                            $pct = 0
-                            if ($e.Total -gt 0) { $pct = [int](100 * $e.Bytes / $e.Total) }
-                            $ativos.Add(('{0}: baixando {1}%' -f $chave, $pct))
-                        }
-                        elseif ($e.Fase -eq 'Processando') {
-                            $l = $e.Linhas
-                            if ($null -ne $e.Processador) { try { $l = $e.Processador.LinhasLidas } catch { } }
-                            $ativos.Add(('{0}: {1:N0} linhas' -f $chave, $l))
-                        }
-                    }
-                    $operacao = ($ativos -join ' | ')
-                    if (-not $operacao) { $operacao = 'aguardando...' }
-                    Write-Progress -Activity $atividade -Status ('{0} de {1} arquivos concluídos' -f $concluidas, $total) -CurrentOperation $operacao -PercentComplete ([int](100 * $concluidas / [math]::Max(1, $total)))
-                }
-                catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
-            }
+            try { Show-PainelProgresso -Painel $painel -Estado $estado }
+            catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
             if ($concluidas -lt $total) { Start-Sleep -Milliseconds 300 }
         }
+        try { Write-ResumoPainel -Painel $painel } catch { Write-Verbose ('Resumo do progresso não gravado: {0}' -f $_.Exception.Message) }
     }
     finally {
         $pendentes = @($tarefas | Where-Object { -not $_.Coletado })
@@ -2973,7 +3423,7 @@ function Invoke-Execucao {
         else {
             try { $pool.Close(); $pool.Dispose() } catch { }
         }
-        Write-Progress -Activity $atividade -Completed
+        try { Complete-PainelProgresso -Painel $painel } catch { }
     }
     return $resultados.ToArray()
 }
@@ -3043,7 +3493,10 @@ function Merge-Consolidado {
         Concatena as saídas de um grupo num único CSV (cabeçalho uma vez), em streaming de bytes. Só consolida
         uma base homogênea e completa; caso contrário mantém o consolidado anterior e lança erro (exit 1).
     #>
-    param([string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg, [hashtable]$IdsListados)
+    param(
+        [string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg, [hashtable]$IdsListados,
+        [string]$Rotulo = 'Consolidação', [int]$Indice = 1, [int]$TotalGrupos = 1
+    )
     $linhasOk = @($Linhas | Where-Object { $_.status -eq 'OK' } | Sort-Object periodo, regiao)
     if ($linhasOk.Count -eq 0) { return }
     $manifestoUF = '_controle\manifesto_{0}.csv' -f $Cfg.UF
@@ -3104,11 +3557,20 @@ function Merge-Consolidado {
     $out = $fsOut
     if ($Cfg.Gzip) { $out = New-Object System.IO.Compression.GZipStream -ArgumentList $fsOut, ([System.IO.Compression.CompressionMode]::Compress) }
     $ok = $false
+    # Barra da consolidação: bytes lidos dos arquivos do grupo (para .gz, do arquivo compactado).
+    $totalBytes = [double]0
+    foreach ($a in $arquivos) { $totalBytes += [double](Get-Item -LiteralPath $a).Length }
+    $feitos = [double]0
+    $marca = [DateTime]::MinValue
+    $buf = New-Object byte[] 1048576
+    $k = 0
     try {
         if ($Cfg.Bom) { $out.Write([byte[]](0xEF, 0xBB, 0xBF), 0, 3) }
         $cabRef = $null
         foreach ($a in $arquivos) {
+            $k++
             $fsIn = [System.IO.File]::OpenRead($a)
+            $tamArq = [double]$fsIn.Length
             $in = $fsIn
             if ($a -like '*.gz') { $in = New-Object System.IO.Compression.GZipStream -ArgumentList $fsIn, ([System.IO.Compression.CompressionMode]::Decompress) }
             try {
@@ -3117,9 +3579,20 @@ function Merge-Consolidado {
                 elseif ([Convert]::ToBase64String($cab) -ne [Convert]::ToBase64String($cabRef)) {
                     throw ('o cabeçalho de {0} difere dos demais' -f $a)
                 }
-                $in.CopyTo($out, 1048576)
+                # Mesmo efeito do Stream.CopyTo (blocos de 1 MB), com a barra atualizada a cada segundo.
+                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $out.Write($buf, 0, $n)
+                    if (([DateTime]::UtcNow - $marca).TotalMilliseconds -ge 1000) {
+                        $marca = [DateTime]::UtcNow
+                        $lidos = $feitos + [double]$fsIn.Position
+                        $fracaoGrupo = $lidos / [math]::Max([double]1, $totalBytes)
+                        $txt = '{0} (grupo {1} de {2}) | arquivo {3} de {4} | {5} de {6}' -f $Grupo, $Indice, $TotalGrupos, $k, $arquivos.Count, (Format-Bytes $lidos), (Format-Bytes $totalBytes)
+                        Write-ProgressoEtapa -Atividade $Rotulo -Status $txt -Fracao ((($Indice - 1) + $fracaoGrupo) / [math]::Max(1, $TotalGrupos))
+                    }
+                }
             }
             finally { $in.Dispose(); if (-not [object]::ReferenceEquals($in, $fsIn)) { $fsIn.Dispose() } }
+            $feitos += $tamArq
         }
         $ok = $true
     }
@@ -3394,6 +3867,7 @@ try {
         Motor = $motorEfetivo; SeteZip = $null; Tentativas = $Tentativas; UsarProxy = [bool]$UsarProxySistema
         ManterCompactados = [bool]$ManterCompactados; Paralelismo = $Paralelismo; Reprocessar = [bool]$Reprocessar
         Grupos = $Script:MetaGrupos; Assinatura = $assinatura; NamespaceMotor = $Script:NamespaceMotor
+        TipoContador = ''
     }
     $defs = Initialize-Definicoes -MetaGrupos $Script:MetaGrupos
     if ($null -ne $Script:Trava) { Clear-TemporariosOrfaos -Cfg $cfg -PastaControle $pastaControle }
@@ -3426,7 +3900,16 @@ try {
     if ($cfg.UsarProxy -and $PSVersionTable.PSVersion.Major -ge 6) {
         Write-Log '-UsarProxySistema não tem efeito no PowerShell 7+: o .NET atual não usa proxy em FTP (a conexão é direta).' 'AVISO'
     }
-    $itens = @(Get-ItensRemotos -Cfg $cfg -Grupos $grupos)
+    # Etapas mostradas na barra de progresso ("Etapa 2 de 3: download e ETL (MG)").
+    $etapas = New-Object System.Collections.Generic.List[string]
+    $etapas.Add('listagem do FTP')
+    if (-not $SomenteListar) {
+        $etapas.Add('download e ETL')
+        if ($Consolidar -and $Cabecalho -ne 'Original') { $etapas.Add('consolidação') }
+    }
+    $rotuloEtapa = { param([int]$N) 'Etapa {0} de {1}: {2} ({3})' -f $N, $etapas.Count, $etapas[$N - 1], $UF }
+    $itens = @(Get-ItensRemotos -Cfg $cfg -Grupos $grupos -Rotulo (& $rotuloEtapa 1))
+    Write-ProgressoEtapa -Atividade (& $rotuloEtapa 1) -Concluir
     $semTamanho = @($itens | Where-Object { $_.Tamanho -le 0 }).Count
     if ($cfg.UsarProxy -and $semTamanho -gt 0) {
         Write-Log 'Modo proxy: o FTP não informou tamanho/data. Republicações do MTE NÃO são detectadas e o download não é conferido pelo tamanho; rode com -Reprocessar de tempos em tempos.' 'AVISO'
@@ -3478,7 +3961,9 @@ try {
             }
             catch { }
 
-            $resultados = @(Invoke-Execucao -Itens $aProcessar -Cfg $cfg -Defs $defs -Manifesto $manifesto -CaminhoManifesto $caminhoManifesto -Mapa $mapa)
+            # Contador de bytes do ETL (barra de progresso): só com o motor C#, cuja compilação já funcionou aqui.
+            if ($cfg.Motor -eq 'CSharp') { $cfg.TipoContador = Initialize-ContadorProgresso }
+            $resultados = @(Invoke-Execucao -Itens $aProcessar -Cfg $cfg -Defs $defs -Manifesto $manifesto -CaminhoManifesto $caminhoManifesto -Mapa $mapa -Atividade (& $rotuloEtapa 2) -IntervaloProgresso $IntervaloProgresso)
             if (@($resultados | Where-Object { $_.Resultado.status -eq 'ERRO' }).Count -gt 0) { $codigoSaida = 1 }
         }
         else {
@@ -3511,10 +3996,15 @@ try {
                 # Ids encontrados no FTP nesta execução: separa os períodos que saíram do FTP dos que estão fora da faixa.
                 $idsListados = @{}
                 foreach ($it in $itens) { $idsListados[[string]$it.Id] = $true }
+                $rotuloConsolidacao = & $rotuloEtapa 3
+                $gi = 0
                 foreach ($g in $grupos) {
-                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg -IdsListados $idsListados }
+                    $gi++
+                    Write-ProgressoEtapa -Atividade $rotuloConsolidacao -Status ('{0} (grupo {1} de {2})' -f $g, $gi, $grupos.Count) -Fracao (($gi - 1) / [math]::Max(1, $grupos.Count))
+                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg -IdsListados $idsListados -Rotulo $rotuloConsolidacao -Indice $gi -TotalGrupos $grupos.Count }
                     catch { Write-Log ('Consolidação de {0} falhou: {1}' -f $g, $_.Exception.Message) 'ERRO'; $codigoSaida = 1 }
                 }
+                Write-ProgressoEtapa -Atividade $rotuloConsolidacao -Concluir
             }
         }
         try { Write-Resumo -Manifesto $manifesto -Grupos $grupos }
