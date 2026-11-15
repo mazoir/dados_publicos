@@ -1,0 +1,179 @@
+{
+    // Tarefas do pipeline RAIS + Novo CAGED. Para rodar: Terminal > Run Task... (ou Ctrl+Shift+P > "Tasks: Run Task")
+    // e escolha uma das tarefas "MTE". Cada tarefa abre um PowerShell novo, num painel próprio do terminal, onde
+    // aparecem as barras de progresso.
+    // - Tarefas sem sufixo: Windows PowerShell 5.1 (powershell.exe, já vem no Windows). Num painel baixo ele mostra a
+    //   barra geral e só as barras de arquivo que couberem; maximize o painel para ver todas.
+    // - Tarefas "- PowerShell 7": pwsh (precisa estar instalado), uma linha por barra em qualquer altura de painel.
+    // Fim da tarefa: a última linha do log diz "Código de saída: N (...)". Com 1 ou 2 o VS Code também mostra
+    // "terminated with exit code: N"; com 0 (sucesso) ele não mostra mensagem.
+    // "command" é fixo de propósito: ${input:...} em "command" de tarefa "process" falha no Windows nas versões do
+    // VS Code anteriores à 1.146 (microsoft/vscode#160891).
+    // Guia: docs/rais_caged_mg.md, seção 16.
+    "version": "2.0.0",
+    "inputs": [
+        {
+            "id": "saida",
+            "type": "promptString",
+            "description": "Pasta de saída (CSVs, manifesto e logs). ~ = sua pasta de usuário; ~\\Dados\\MTE é o padrão do script. Use a MESMA pasta das execuções anteriores (ex.: a da tarefa agendada): em outra pasta, tudo é baixado e processado de novo",
+            "default": "~\\Dados\\MTE"
+        },
+        {
+            "id": "uf",
+            "type": "pickString",
+            "description": "UF filtrada",
+            "options": [
+                "MG", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MS", "MT", "PA",
+                "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"
+            ],
+            "default": "MG"
+        },
+        {
+            "id": "bases",
+            "type": "pickString",
+            "description": "Bases (RAIS = vínculos + estabelecimentos; CAGED = MOV + FOR + EXC)",
+            "options": ["RAIS,CAGED", "RAIS", "CAGED", "RAIS_VINC", "RAIS_ESTAB", "CAGED_MOV", "CAGED_FOR", "CAGED_EXC"],
+            "default": "RAIS,CAGED"
+        },
+        {
+            "id": "anoInicial",
+            "type": "promptString",
+            "description": "Ano inicial (2020 ou depois; o ano final é o corrente)",
+            "default": "2020"
+        },
+        {
+            "id": "anoTeste",
+            "type": "promptString",
+            "description": "Ano do teste rápido (só o CAGED de exclusões, poucos MB)",
+            "default": "2025"
+        }
+    ],
+    "tasks": [
+        {
+            "label": "MTE 1 - Simulação (lista o FTP, não baixa nada)",
+            "detail": "-SomenteListar: mostra o que existe no FTP e o que seria baixado/processado nesta pasta, e por quê",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-SomenteListar"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 2 - Teste rápido (CAGED exclusões de um ano)",
+            "detail": "Baixa e processa só o CAGED_EXC do ano escolhido: confere FTP, 7-Zip e ETL em poucos minutos",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "CAGED_EXC",
+                "-AnoInicial", "${input:anoTeste}", "-AnoFinal", "${input:anoTeste}"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 3 - Carga completa (CSV)",
+            "detail": "Bases e período escolhidos, com CSV consolidado por grupo no final. Incremental na mesma pasta. Não alterne com a MTE 4 na mesma pasta: refaz tudo",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-Consolidar"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 4 - Carga completa (CSV compactado .gz)",
+            "detail": "Como a MTE 3, gravando .csv.gz (8 a 10 vezes menor; o Power Query lê com Binary.Decompress). Use uma pasta só para o .gz: alternar com a MTE 3 refaz tudo",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-Consolidar", "-CompactarSaida"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 5 - Acompanhar o log mais recente (ao vivo)",
+            "detail": "Mostra o fim do log da última execução da pasta e segue as linhas novas (ex.: tarefa agendada; informe a pasta dela). Feche com a lixeira do terminal",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-Command",
+                "$s = $env:MTE_SAIDA; if (-not $s) { $s = '~\\Dados\\MTE' }; if ($s -match '^~(?=$|[\\\\/])') { $s = $HOME + $s.Substring(1) }; $pasta = Join-Path -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($s) -ChildPath '_controle\\logs'; $log = Get-ChildItem -LiteralPath $pasta -Filter 'execucao_*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1; if ($null -eq $log) { Write-Host ('Nenhum log em ' + $pasta) } else { Write-Host ('Acompanhando ' + $log.FullName); Get-Content -LiteralPath $log.FullName -Tail 40 -Wait }"
+            ],
+            // A pasta vai por variável de ambiente, e não dentro do comando: um apóstrofo no caminho não o quebra.
+            "options": { "cwd": "${workspaceFolder}", "env": { "MTE_SAIDA": "${input:saida}" } },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 1 - Simulação - PowerShell 7",
+            "detail": "Como a MTE 1, no pwsh (precisa do PowerShell 7 instalado: winget install Microsoft.PowerShell)",
+            "type": "process",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-SomenteListar"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 2 - Teste rápido - PowerShell 7",
+            "detail": "Como a MTE 2, no pwsh (precisa do PowerShell 7 instalado)",
+            "type": "process",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "CAGED_EXC",
+                "-AnoInicial", "${input:anoTeste}", "-AnoFinal", "${input:anoTeste}"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 3 - Carga completa (CSV) - PowerShell 7",
+            "detail": "Como a MTE 3, no pwsh (precisa do PowerShell 7 instalado). Não alterne com a MTE 4 na mesma pasta: refaz tudo",
+            "type": "process",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-Consolidar"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        },
+        {
+            "label": "MTE 4 - Carga completa (.gz) - PowerShell 7",
+            "detail": "Como a MTE 4, no pwsh (precisa do PowerShell 7 instalado). Use uma pasta só para o .gz",
+            "type": "process",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/pipeline_rais_caged.ps1",
+                "-Saida", "${input:saida}", "-UF", "${input:uf}", "-Bases", "${input:bases}",
+                "-AnoInicial", "${input:anoInicial}", "-Consolidar", "-CompactarSaida"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "focus": true, "clear": true, "showReuseMessage": false }
+        }
+    ]
+}
