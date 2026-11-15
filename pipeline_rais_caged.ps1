@@ -35,8 +35,10 @@
 
     PROGRESSO: barras na janela do PowerShell com a etapa atual (listagem do FTP, download e ETL,
     consolidação), o percentual geral (ponderado pelo tamanho dos arquivos), a velocidade, o tempo restante
-    estimado e uma barra por arquivo em andamento (download ou ETL, com linhas por segundo). A cada
-    -IntervaloProgresso segundos, uma linha "Progresso:" com o mesmo resumo vai também para o log.
+    estimado e uma barra por arquivo em andamento (download ou ETL, com linhas por segundo). No Windows
+    PowerShell 5.1 o painel ocupa no máximo 1/3 da altura da janela: os arquivos que não cabem aparecem
+    na linha abaixo da barra geral (janela maximizada ou PowerShell 7 = uma barra por arquivo). A cada
+    -IntervaloProgresso segundos, em todas as etapas, uma linha "Progresso:" vai também para o log.
 
     Execuções seguintes são INCREMENTAIS: só processa o que é novo, foi republicado pelo MTE, teve a
     saída apagada ou foi gerado com outra configuração (delimitador, cabeçalho, decimal etc.).
@@ -45,7 +47,8 @@
     em _controle\execucao.lock).
 
 .PARAMETER Saida
-    Pasta raiz de saída. Padrão: <perfil do usuário>\Dados\MTE.
+    Pasta raiz de saída. Padrão: <perfil do usuário>\Dados\MTE. Aceita ~ para a pasta do usuário
+    (ex.: ~\Dados\MTE, o padrão das tarefas do VS Code).
 
 .PARAMETER AnoInicial
     Primeiro ano (RAIS: ano-base; CAGED: ano da competência do arquivo). Mínimo 2020 (início do Novo CAGED).
@@ -120,8 +123,9 @@
     Tentativas por download/listagem antes de desistir. Padrão 5.
 
 .PARAMETER IntervaloProgresso
-    Segundos entre as linhas "Progresso:" gravadas no log e no console (padrão 60; 0 desliga). A barra de
-    progresso da janela é atualizada a cada segundo, qualquer que seja este valor.
+    Segundos entre as linhas "Progresso:" gravadas no log e no console, em todas as etapas (listagem,
+    download e ETL, consolidação). Padrão 60; 0 desliga. A barra de progresso da janela é atualizada a
+    cada segundo, qualquer que seja este valor.
 
 .PARAMETER SomenteListar
     Só mostra o que existe no FTP e o que seria baixado/processado (simulação), sem baixar nada.
@@ -142,7 +146,7 @@
     Execução agendada (Agendador de Tarefas), saída compactada.
 
 .NOTES
-    Versão ...... 1.2.0
+    Versão ...... 1.2.1
     Requisitos .. PowerShell 5.1+ (.NET Framework 4.5+) ou PowerShell 7+; 7-Zip (ou -Baixar7Zip);
                   saída liberada para ftp.mtps.gov.br (porta 21 + portas passivas); modo FullLanguage.
     Encoding .... Este arquivo é UTF-8 COM BOM (obrigatório para o Windows PowerShell 5.1 ler os acentos).
@@ -225,7 +229,7 @@ $ErrorActionPreference = 'Stop'
 
 #region ============================ 1. CONFIGURAÇÃO ESTÁTICA ============================
 
-$Script:VersaoScript = '1.2.0'
+$Script:VersaoScript = '1.2.1'
 # Versão do layout de saída (entra na assinatura do manifesto): mudar este valor força o reprocessamento de
 # tudo e impede o -Consolidar de misturar saídas antigas e novas. Mude-o ao alterar o dicionário OU qualquer
 # regra de leitura/normalização que mude o conteúdo gerado para a mesma entrada.
@@ -240,6 +244,10 @@ $Script:ListagemIncompleta = $false   # alguma pasta do FTP não pôde ser lista
 $Script:ErroControle = $false         # manifesto/mapeamento gravado só como .pendente.csv (ou não gravado)
 $Script:ManifestoAlterado = $false    # manifesto em memória ainda não gravado no arquivo principal
 $Script:Utf8ComBom = New-Object System.Text.UTF8Encoding -ArgumentList $true
+# Barra das etapas fora do download/ETL (listagem, consolidação): etapa atual e marcas da linha "Progresso:".
+$Script:EtapaProgresso = ''
+$Script:InicioEtapa = [DateTime]::UtcNow
+$Script:UltimoTextoEtapa = [DateTime]::UtcNow
 
 $Script:CodigoUF = @{
     RO = '11'; AC = '12'; AM = '13'; RR = '14'; PA = '15'; AP = '16'; TO = '17'
@@ -1419,14 +1427,15 @@ function Invoke-FtpDownload {
                 }
                 if (([DateTime]::UtcNow - $marca).TotalMilliseconds -ge 500) {
                     $marca = [DateTime]::UtcNow
-                    if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total; $EstadoItem.Transferidos = $transfBase + $transf }
+                    # Transferidos antes de Bytes: a barra lê na ordem inversa e nunca superestima o que já estava no .part.
+                    if ($null -ne $EstadoItem) { $EstadoItem.Transferidos = $transfBase + $transf; $EstadoItem.Bytes = $total }
                     if ($null -ne $Controle -and $Controle.Cancelar) { throw 'Cancelado pelo usuário.' }
                 }
             }
             $fs.Dispose(); $fs = $null
             $rs.Dispose(); $rs = $null
             $resp.Close(); $resp = $null
-            if ($null -ne $EstadoItem) { $EstadoItem.Bytes = $total; $EstadoItem.Transferidos = $transfBase + $transf }
+            if ($null -ne $EstadoItem) { $EstadoItem.Transferidos = $transfBase + $transf; $EstadoItem.Bytes = $total }
             $tam = (Get-Item -LiteralPath $part).Length
             if ($TamanhoEsperado -gt 0 -and $tam -ne $TamanhoEsperado) {
                 if ($tam -gt $TamanhoEsperado) { Remove-Item -LiteralPath $part -Force }
@@ -2173,6 +2182,11 @@ function Invoke-EtlArquivo {
                 $Est.EtlBase = [long]$Est.EtlBase + [long]$ent.Tamanho
                 continue
             }
+            if (-not $Cfg.TipoContador) {
+                # Sem o contador de bytes, a barra estima o percentual do ETL por linhas lidas x bytes por linha.
+                $quebras = [System.Text.Encoding]::ASCII.GetString($amostra).Split([char]10).Length - 1
+                if ($quebras -ge 2) { $Est.BytesPorLinha = $amostra.Length / [double]$quebras }
+            }
             $enc = Get-EncodingAmostra -Bytes $amostra -Padrao $meta.EncodingPadrao
             $linhaCab = Get-CabecalhoAmostra -Bytes $amostra -NomeEncoding $enc -AmostraCompleta ($amostra.Length -lt 262144)
             $delim = Get-DelimitadorCabecalho -Linha $linhaCab
@@ -2274,10 +2288,12 @@ function Invoke-ProcessarItem {
     $inicio = Get-Date
     $id = $Item.Id
     # Estado lido pela barra de progresso (thread principal): fase, bytes baixados (Bytes inclui o que já estava
-    # no .part; Transferidos, só o desta execução), linhas e bytes descompactados lidos no ETL.
+    # no .part; Transferidos, só o desta execução), períodos de download (Downloads), linhas e bytes descompactados
+    # lidos no ETL (BytesPorLinha: estimativa do percentual quando não há contador de bytes).
     $est = @{
         Fase = 'Aguardando'; Bytes = [long]0; Total = [long]$Item.Tamanho; Transferidos = [long]0; Linhas = [long]0
         Processador = $null; Processo = $null; Contador = $null; EtlBase = [long]0; EtlTotal = [long]0
+        BytesPorLinha = [double]0; Downloads = (New-Object System.Collections.ArrayList)
     }
     $Estado[$id] = $est
     $meta = $Cfg.Grupos[$Item.Grupo]
@@ -2305,12 +2321,21 @@ function Invoke-ProcessarItem {
                 else { Remove-Item -LiteralPath $Item.CaminhoLocal -Force }
             }
             if ($baixar) {
+                $est.Bytes = [long]0
                 $est.Fase = 'Download'
                 $t0 = Get-Date
                 Write-LogFila $Fila 'INFO' $id ('Baixando {0} ({1}).' -f $Item.NomeArquivo, (Format-BytesLocal $Item.Tamanho))
-                Invoke-FtpDownload -Url $Item.Url -Destino $Item.CaminhoLocal -TamanhoEsperado ([long]$Item.Tamanho) -Tentativas $Cfg.Tentativas -UsarProxy ([bool]$Cfg.UsarProxy) -EstadoItem $est -Controle $Controle -Fila $Fila -Id $id -DataRemota ([string]$Item.DataRemota)
+                $iniDl = [DateTime]::UtcNow.Ticks
+                $transfAntes = [long]$est.Transferidos
+                try {
+                    Invoke-FtpDownload -Url $Item.Url -Destino $Item.CaminhoLocal -TamanhoEsperado ([long]$Item.Tamanho) -Tentativas $Cfg.Tentativas -UsarProxy ([bool]$Cfg.UsarProxy) -EstadoItem $est -Controle $Controle -Fila $Fila -Id $id -DataRemota ([string]$Item.DataRemota)
+                }
+                finally { [void]$est.Downloads.Add([pscustomobject]@{ Inicio = $iniDl; Fim = [DateTime]::UtcNow.Ticks }) }
                 $seg = [math]::Max(0.1, ((Get-Date) - $t0).TotalSeconds)
-                Write-LogFila $Fila 'INFO' $id ('Download concluído em {0:N0}s ({1}/s).' -f $seg, (Format-BytesLocal ((Get-Item -LiteralPath $Item.CaminhoLocal).Length / $seg)))
+                # Velocidade pelos bytes recebidos agora (numa retomada, o que já estava no .part não conta).
+                $recebidos = [long]$est.Transferidos - $transfAntes
+                if ($recebidos -gt 0) { Write-LogFila $Fila 'INFO' $id ('Download concluído em {0:N0}s ({1} recebidos, {2}/s).' -f $seg, (Format-BytesLocal $recebidos), (Format-BytesLocal ($recebidos / $seg))) }
+                else { Write-LogFila $Fila 'INFO' $id ('Download concluído em {0:N0}s.' -f $seg) }
             }
             $est.Fase = 'Processando'
             try {
@@ -3005,37 +3030,104 @@ function Get-ChavesEstado {
 #region --- Barra de progresso (thread principal; tudo aqui é cosmético e nunca interrompe a execução) ---
 
 function Format-Duracao {
-    <# Duração legível: 40 -> '40 s'; 95 -> '1 min 35 s'; 3725 -> '1 h 02 min'. #>
+    <# Duração legível: 40 -> '40 s'; 95 -> '1 min 35 s'; 3725 -> '1 h 02 min'; de 99 h 59 min em diante, 'mais de 99 h'. #>
     param([double]$Segundos)
     if ([double]::IsNaN($Segundos) -or [double]::IsInfinity($Segundos) -or $Segundos -lt 0) { return '?' }
+    # Antes do [long]: uma velocidade perto de zero (download parado) dá valores acima do limite do Int64.
+    if ($Segundos -ge 359940) { return 'mais de 99 h' }
     $s = [long][math]::Round($Segundos)
     if ($s -lt 60) { return ('{0} s' -f $s) }
     if ($s -lt 3600) { return ('{0} min {1:00} s' -f [long][math]::Floor($s / 60), ($s % 60)) }
     return ('{0} h {1:00} min' -f [long][math]::Floor($s / 3600), [long][math]::Floor(($s % 3600) / 60))
 }
 
+function Format-Faltam {
+    <# Tempo restante: 'faltam ~1 min 35 s', 'falta menos de 1 s' ou 'faltam mais de 99 h'. #>
+    param([double]$Segundos)
+    if ([double]::IsNaN($Segundos) -or [double]::IsInfinity($Segundos) -or $Segundos -ge 359940) { return 'faltam mais de 99 h' }
+    if ($Segundos -lt 1) { return 'falta menos de 1 s' }
+    return ('faltam ~{0}' -f (Format-Duracao $Segundos))
+}
+
+function Format-ContagemArquivos {
+    <# '1 de 1 arquivo', '3 de 31 arquivos'. #>
+    param([int]$Feitos, [int]$Total)
+    $nome = 'arquivos'
+    if ($Total -eq 1) { $nome = 'arquivo' }
+    return ('{0} de {1} {2}' -f $Feitos, $Total, $nome)
+}
+
 function Write-ProgressoEtapa {
     <#
         Barra das etapas fora do download/ETL (listagem do FTP, consolidação). Fracao de 0 a 1; negativa quando
-        não há como estimar (a barra mostra só o texto).
+        não há como estimar (a barra mostra só o texto). A cada -IntervaloProgresso segundos grava também a linha
+        "Progresso:" no log (execução agendada, tarefa MTE 5 do VS Code).
     #>
     param([string]$Atividade, [string]$Status = '...', [double]$Fracao = -1, [switch]$Concluir)
     try {
-        if ($Concluir) { Write-Progress -Id 1 -Activity $Atividade -Completed; return }
+        if ($Concluir) {
+            $Script:EtapaProgresso = ''
+            Write-Progress -Id 1 -Activity $Atividade -Completed
+            return
+        }
         $pct = -1
         if ($Fracao -ge 0) { $pct = [int][math]::Max(0, [math]::Min(100, [math]::Floor(100 * $Fracao))) }
         if (-not $Status) { $Status = '...' }
-        Write-Progress -Id 1 -Activity $Atividade -Status $Status -PercentComplete $pct
+        # O número do percentual vai no texto (o desenho da barra do 5.1 não o mostra), como na barra do download/ETL.
+        $statusTela = $Status
+        if ($pct -ge 0) { $statusTela = '{0}% | {1}' -f $pct, $Status }
+        Write-Progress -Id 1 -Activity $Atividade -Status $statusTela -PercentComplete $pct
+        $agora = [DateTime]::UtcNow
+        if ($Script:EtapaProgresso -ne $Atividade) {
+            $Script:EtapaProgresso = $Atividade
+            $Script:InicioEtapa = $agora
+            $Script:UltimoTextoEtapa = $agora
+        }
+        elseif ($Script:IntervaloProgresso -gt 0 -and ($agora - $Script:UltimoTextoEtapa).TotalSeconds -ge $Script:IntervaloProgresso) {
+            $Script:UltimoTextoEtapa = $agora
+            $txt = 'Progresso: {0}' -f $Atividade
+            if ($pct -ge 0) { $txt += (' | {0}%' -f $pct) }
+            Write-Log ('{0} | {1} | decorrido {2}' -f $txt, $Status, (Format-Duracao ($agora - $Script:InicioEtapa).TotalSeconds))
+        }
     }
     catch { Write-Verbose ('Progresso não atualizado: {0}' -f $_.Exception.Message) }
+}
+
+function Test-PainelClassico {
+    <#
+        $true quando o console desenha as barras no estilo clássico: Windows PowerShell 5.1, PowerShell 7.0/7.1 e a
+        vista Classic do 7.2+ ($PSStyle.Progress.View). A vista Minimal do 7.2+ usa uma linha por barra.
+    #>
+    if ($PSVersionTable.PSVersion.Major -lt 6) { return $true }
+    $estilo = Get-Variable -Name PSStyle -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $estilo) { return $true }
+    try { return ([string]$estilo.Progress.View -eq 'Classic') } catch { return $true }
+}
+
+function Get-LimiteBarrasArquivo {
+    <#
+        Quantas barras de arquivo cabem abaixo da barra geral no painel clássico. Esse painel tem no máximo
+        max(5, altura da janela / 3) linhas; a barra geral usa 5 e cada barra de arquivo, 3. O que não cabe o
+        console "comprime": some o desenho da barra e o percentual aparece duas vezes ("45% 45% | ..."). Por isso
+        os arquivos que não cabem vão para a linha de baixo da barra geral. -1 = sem limite (vista Minimal do
+        PowerShell 7, uma linha por barra, ou console sem janela).
+    #>
+    param([bool]$Classico)
+    if (-not $Classico) { return -1 }
+    $altura = 0
+    try { $altura = [int]$Host.UI.RawUI.WindowSize.Height } catch { return -1 }
+    if ($altura -le 0) { return -1 }
+    $linhas = [math]::Max(5, [math]::Floor($altura / 3))
+    return [int][math]::Max(0, [math]::Floor(($linhas - 5) / 3))
 }
 
 function New-PainelProgresso {
     <#
         Estado da barra do download/ETL. Cada arquivo pesa o seu tamanho no FTP (sem tamanho: a média dos
-        conhecidos), metade para o download e metade para o ETL.
+        conhecidos), metade para o download e metade para o ETL. ComContador: o ETL tem o contador de bytes
+        (percentual exato); sem ele, o percentual do ETL é estimado pelas linhas lidas.
     #>
-    param([object[]]$Itens, [string]$Atividade, [int]$IntervaloTexto)
+    param([object[]]$Itens, [string]$Atividade, [int]$IntervaloTexto, [bool]$ComContador = $false)
     $conhecidos = @($Itens | Where-Object { [long]$_.Tamanho -gt 0 })
     $padrao = [double]1MB
     if ($conhecidos.Count -gt 0) { $padrao = [double]($conhecidos | Measure-Object -Property Tamanho -Average).Average }
@@ -3047,12 +3139,15 @@ function New-PainelProgresso {
         $pesos[[string]$i.Id] = $peso
         $soma += $peso
     }
+    $classico = $true
+    try { $classico = [bool](Test-PainelClassico) } catch { $classico = $true }
     return @{
         Atividade = $Atividade; Inicio = [DateTime]::UtcNow; Total = @($Itens).Count
-        Pesos = $pesos; PesoTotal = [math]::Max([double]1, $soma); PesoConcluido = [double]0
-        Concluidos = 0; Erros = 0; Baixados = [double]0
+        Pesos = $pesos; PesoTotal = [math]::Max([double]1, $soma); PesoConcluido = [double]0; PesoGratisConcluido = [double]0
+        Concluidos = 0; Erros = 0; Baixados = [double]0; ComContador = $ComContador; Classico = $classico
         Slots = @{}; Amostras = @{}; UltimoPai = $null; Retocado = $false
         UltimaBarra = [DateTime]::MinValue; UltimoTexto = [DateTime]::UtcNow; IntervaloTexto = $IntervaloTexto
+        Intervalos = (New-Object System.Collections.Generic.List[object])
     }
 }
 
@@ -3063,11 +3158,20 @@ function Get-MediaMovel {
 }
 
 function Update-AmostraProgresso {
-    <# Lê o estado de um arquivo em andamento e atualiza as velocidades (média móvel entre leituras). #>
+    <#
+        Lê o estado de um arquivo em andamento e atualiza as velocidades (média móvel entre leituras). A velocidade
+        do download vem dos bytes recebidos NESTA execução (Transferidos): numa retomada, Bytes salta para o tamanho
+        do .part, que não foi baixado agora. Gratis = fração do arquivo que já estava pronta ao começar (resto de
+        .part retomado, .7z reaproveitado): não entra no ritmo usado para estimar o tempo restante.
+    #>
     param([hashtable]$Painel, [string]$Id, [hashtable]$Est)
     $agora = [DateTime]::UtcNow
     $fase = [string]$Est.Fase
+    # Bytes antes de Transferidos (o worker grava na ordem inversa): a diferença nunca superestima o .part.
     $bytes = [long]$Est.Bytes
+    $transf = [long]0
+    if ($null -ne $Est.Transferidos) { $transf = [long]$Est.Transferidos }
+    $total = [long]$Est.Total
     $linhas = [long]$Est.Linhas
     if ($null -ne $Est.Processador) { try { $linhas = [long]$Est.Processador.LinhasLidas } catch { } }
     $etl = [long]-1
@@ -3075,25 +3179,47 @@ function Update-AmostraProgresso {
     if ($null -ne $contador) { try { $etl = [long]$Est.EtlBase + [long]$contador.BytesLidos } catch { $etl = [long]-1 } }
     $a = $Painel.Amostras[$Id]
     if ($null -eq $a) {
-        $a = @{ T = $agora; Fase = $fase; Bytes = $bytes; Linhas = $linhas; Etl = $etl; VelDl = [double]0; VelLin = [double]0; VelEtl = [double]0; Transferidos = [long]0 }
+        $a = @{
+            T = $agora; Fase = $fase; Transf = $transf; Linhas = $linhas; Etl = $etl
+            VelDl = [double]0; VelLin = [double]0; VelEtl = [double]0
+            FaseVista = $fase; MudouEm = $agora; TransfVisto = $transf; SemDados = $false; SemDadosSeg = [double]0
+            ViuDownload = $false; Gratis = [double]0; FracaoMax = [double]0
+        }
         $Painel.Amostras[$Id] = $a
     }
     else {
         $dt = ($agora - $a.T).TotalSeconds
         if ($dt -ge 0.5) {
-            if ($fase -eq 'Download' -and $a.Fase -eq 'Download' -and $bytes -ge $a.Bytes) {
-                $a.VelDl = Get-MediaMovel -Media $a.VelDl -Valor (($bytes - $a.Bytes) / $dt)
+            if ($fase -eq 'Download' -and $a.Fase -eq 'Download' -and $transf -ge $a.Transf) {
+                $a.VelDl = Get-MediaMovel -Media $a.VelDl -Valor (($transf - $a.Transf) / $dt)
             }
             if ($fase -eq 'Processando' -and $a.Fase -eq 'Processando') {
                 if ($linhas -ge $a.Linhas) { $a.VelLin = Get-MediaMovel -Media $a.VelLin -Valor (($linhas - $a.Linhas) / $dt) }
                 if ($etl -ge 0 -and $a.Etl -ge 0 -and $etl -ge $a.Etl) { $a.VelEtl = Get-MediaMovel -Media $a.VelEtl -Valor (($etl - $a.Etl) / $dt) }
             }
-            $a.T = $agora; $a.Fase = $fase; $a.Bytes = $bytes; $a.Linhas = $linhas; $a.Etl = $etl
+            $a.T = $agora; $a.Fase = $fase; $a.Transf = $transf; $a.Linhas = $linhas; $a.Etl = $etl
         }
+    }
+    # Download sem bytes chegando (conexão demorando ou FTP parado): sem velocidade nem tempo restante.
+    if ($fase -ne $a.FaseVista -or $transf -ne $a.TransfVisto) { $a.FaseVista = $fase; $a.TransfVisto = $transf; $a.MudouEm = $agora }
+    $a.SemDadosSeg = ($agora - $a.MudouEm).TotalSeconds
+    $a.SemDados = ($fase -eq 'Download' -and $a.SemDadosSeg -ge 10)
+    if ($fase -eq 'Download') {
+        $a.ViuDownload = $true
+        if ($total -gt 0) {
+            $g = 0.5 * [math]::Max([double]0, [double]($bytes - $transf)) / [double]$total
+            if ($g -gt $a.Gratis) { $a.Gratis = [math]::Min(0.5, $g) }
+        }
+    }
+    elseif (-not $a.ViuDownload -and @('Processando', 'Testando', 'Concluído') -contains $fase) {
+        # Download não visto: .7z reaproveitado (nada veio do FTP agora) ou download rápido demais para a amostra.
+        $a.ViuDownload = $true
+        if ($total -gt 0) { $a.Gratis = 0.5 * [math]::Max([double]0, 1 - $transf / [double]$total) }
+        elseif ($transf -le 0) { $a.Gratis = 0.5 }
     }
     $a.LinhasAgora = $linhas
     $a.EtlAgora = $etl
-    if ($null -ne $Est.Transferidos) { $a.Transferidos = [long]$Est.Transferidos }
+    $a.Transferidos = $transf
     return $a
 }
 
@@ -3102,24 +3228,26 @@ function Get-InfoItemProgresso {
         Fração do arquivo no total (download = 0 a 0,5; ETL = 0,5 a 1), percentual da fase atual (-1 = sem barra)
         e textos da barra e da linha "Progresso:".
     #>
-    param([hashtable]$Est, [hashtable]$Amostra)
+    param([hashtable]$Est, [hashtable]$Amostra, [bool]$ComContador = $false)
     $fase = [string]$Est.Fase
     $info = @{ Fracao = [double]0; Pct = -1; Texto = 'aguardando'; Curto = 'aguardando' }
     if ($fase -eq 'Download') {
         $total = [long]$Est.Total
         $bytes = [long]$Est.Bytes
+        $ritmo = ''
+        if ($Amostra.SemDados) { $ritmo = ' | aguardando dados do FTP há {0}' -f (Format-Duracao $Amostra.SemDadosSeg) }
+        elseif ($Amostra.VelDl -gt 0) { $ritmo = ' | {0}/s' -f (Format-Bytes $Amostra.VelDl) }
         if ($total -gt 0) {
             $f = [math]::Min([double]1, $bytes / [double]$total)
             $info.Fracao = 0.5 * $f
             $info.Pct = [int][math]::Floor(100 * $f)
-            $txt = 'baixando {0}% | {1} de {2}' -f $info.Pct, (Format-Bytes $bytes), (Format-Bytes $total)
-            if ($Amostra.VelDl -gt 0) { $txt += (' | {0}/s | faltam ~{1}' -f (Format-Bytes $Amostra.VelDl), (Format-Duracao (($total - $bytes) / $Amostra.VelDl))) }
+            $txt = 'baixando {0}% | {1} de {2}{3}' -f $info.Pct, (Format-Bytes $bytes), (Format-Bytes $total), $ritmo
+            if (-not $Amostra.SemDados -and $Amostra.VelDl -gt 0) { $txt += (' | {0}' -f (Format-Faltam (($total - $bytes) / $Amostra.VelDl))) }
             $info.Curto = 'baixando {0}%' -f $info.Pct
         }
         else {
             $info.Fracao = 0.25
-            $txt = 'baixando {0} (tamanho desconhecido)' -f (Format-Bytes $bytes)
-            if ($Amostra.VelDl -gt 0) { $txt += (' | {0}/s' -f (Format-Bytes $Amostra.VelDl)) }
+            $txt = 'baixando {0} (tamanho desconhecido){1}' -f (Format-Bytes $bytes), $ritmo
             $info.Curto = 'baixando {0}' -f (Format-Bytes $bytes)
         }
         $info.Texto = $txt
@@ -3128,26 +3256,55 @@ function Get-InfoItemProgresso {
         $linhas = [long]$Amostra.LinhasAgora
         $etl = [long]$Amostra.EtlAgora
         $etlTotal = [long]$Est.EtlTotal
+        $etlBase = [long]$Est.EtlBase
         if ($etl -ge 0 -and $etlTotal -gt 0) {
+            # Contador de bytes: bytes descompactados lidos / tamanho descompactado informado pelo 7-Zip.
             $f = [math]::Min(0.99, $etl / [double]$etlTotal)
             $info.Fracao = 0.5 + 0.5 * $f
             $info.Pct = [int][math]::Floor(100 * $f)
             $txt = 'processando {0}% | {1:N0} linhas' -f $info.Pct, $linhas
             if ($Amostra.VelLin -gt 0) { $txt += (' | {0:N0} linhas/s' -f $Amostra.VelLin) }
-            if ($Amostra.VelEtl -gt 0) { $txt += (' | faltam ~{0}' -f (Format-Duracao (($etlTotal - $etl) / $Amostra.VelEtl))) }
+            if ($Amostra.VelEtl -gt 0) { $txt += (' | {0}' -f (Format-Faltam (($etlTotal - $etl) / $Amostra.VelEtl))) }
+            $info.Curto = 'processando {0}%' -f $info.Pct
+        }
+        elseif ($ComContador) {
+            # Entre as leituras (7-Zip listando a entrada ou lendo a amostra, troca de entrada, gravação do
+            # resultado) vale o que já foi lido: a barra não volta para trás.
+            $f = [double]0
+            if ($etlTotal -gt 0) { $f = [math]::Min(0.99, $etlBase / [double]$etlTotal) }
+            $info.Fracao = 0.5 + 0.5 * $f
+            $info.Pct = [int][math]::Floor(100 * $f)
+            $txt = 'processando {0}% | {1:N0} linhas' -f $info.Pct, $linhas
             $info.Curto = 'processando {0}%' -f $info.Pct
         }
         else {
-            # Sem o contador de bytes (motor PowerShell): só as linhas lidas.
-            $info.Fracao = 0.75
-            $txt = 'processando {0:N0} linhas' -f $linhas
-            if ($Amostra.VelLin -gt 0) { $txt += (' | {0:N0} linhas/s' -f $Amostra.VelLin) }
-            $info.Curto = 'processando {0:N0} linhas' -f $linhas
+            # Sem o contador (motor PowerShell ou contador indisponível): estimativa pelas linhas lidas x bytes por
+            # linha da amostra do início da entrada (o "~" no texto indica que o percentual é aproximado).
+            $bpl = [double]0
+            if ($null -ne $Est.BytesPorLinha) { $bpl = [double]$Est.BytesPorLinha }
+            if ($bpl -gt 0 -and $etlTotal -gt 0) {
+                $estimado = [math]::Max([double]$etlBase, $linhas * $bpl)
+                $f = [math]::Min(0.99, $estimado / [double]$etlTotal)
+                $info.Fracao = 0.5 + 0.5 * $f
+                $info.Pct = [int][math]::Floor(100 * $f)
+                $txt = 'processando ~{0}% | {1:N0} linhas' -f $info.Pct, $linhas
+                if ($Amostra.VelLin -gt 0) {
+                    $txt += (' | {0:N0} linhas/s | {1}' -f $Amostra.VelLin, (Format-Faltam ([math]::Max([double]0, $etlTotal - $estimado) / ($Amostra.VelLin * $bpl))))
+                }
+                $info.Curto = 'processando ~{0}%' -f $info.Pct
+            }
+            else {
+                $info.Fracao = 0.5
+                $txt = 'processando {0:N0} linhas' -f $linhas
+                if ($Amostra.VelLin -gt 0) { $txt += (' | {0:N0} linhas/s' -f $Amostra.VelLin) }
+                $info.Curto = 'processando {0:N0} linhas' -f $linhas
+            }
         }
         $info.Texto = $txt
     }
     elseif ($fase -eq 'Testando') {
-        $info.Fracao = 0.9
+        # O ETL falhou e o 7-Zip confere o arquivo; na barra geral o arquivo fica onde estava.
+        $info.Fracao = 0.5
         $info.Texto = 'testando a integridade do arquivo (7z t)'
         $info.Curto = 'testando a integridade'
     }
@@ -3163,7 +3320,8 @@ function Get-InfoItemProgresso {
 function Show-PainelProgresso {
     <#
         Barra geral do download/ETL (percentual ponderado pelo tamanho, velocidade, tempo restante) e, abaixo
-        dela, uma barra por arquivo em andamento. A cada IntervaloTexto segundos grava a linha "Progresso:".
+        dela, uma barra por arquivo em andamento (no painel clássico, só as que cabem na janela; as outras vão
+        para a linha de baixo da barra geral). A cada IntervaloTexto segundos grava a linha "Progresso:".
     #>
     param([hashtable]$Painel, [hashtable]$Estado, [switch]$Forcar)
     $agora = [DateTime]::UtcNow
@@ -3182,45 +3340,88 @@ function Show-PainelProgresso {
     $Painel.Retocado = $false
     $ativos = New-Object System.Collections.Generic.List[object]
     $pesoAndamento = [double]0
+    $pesoGratis = [double]$Painel.PesoGratisConcluido
     $velDl = [double]0
     $baixadosAtivos = [double]0
     foreach ($id in (Get-ChavesEstado -Estado $Estado)) {
         $e = $Estado[$id]
         if ($null -eq $e) { continue }
-        $a = Update-AmostraProgresso -Painel $Painel -Id ([string]$id) -Est $e
-        $info = Get-InfoItemProgresso -Est $e -Amostra $a
-        $peso = $Painel.Pesos[[string]$id]
+        $chave = [string]$id
+        $peso = $Painel.Pesos[$chave]
         if ($null -eq $peso) { $peso = [double]0 }
-        $pesoAndamento += [double]$peso * $info.Fracao
-        if ([string]$e.Fase -eq 'Download') { $velDl += $a.VelDl }
-        $baixadosAtivos += [double]$a.Transferidos
-        $ativos.Add([pscustomobject]@{ Id = [string]$id; Info = $info })
+        # Um arquivo com estado inesperado não pode travar o painel inteiro.
+        try {
+            $a = Update-AmostraProgresso -Painel $Painel -Id $chave -Est $e
+            $info = Get-InfoItemProgresso -Est $e -Amostra $a -ComContador ([bool]$Painel.ComContador)
+            # A barra geral nunca volta: um arquivo que recomeça (ex.: .7z danificado, baixado de novo) fica parado
+            # nela até passar do ponto em que estava. A barra do próprio arquivo mostra o que ele está fazendo.
+            if ([double]$info.Fracao -lt [double]$a.FracaoMax) { $info.Fracao = [double]$a.FracaoMax } else { $a.FracaoMax = [double]$info.Fracao }
+            $pesoGratis += [double]$peso * [double]$a.Gratis
+            if ([string]$e.Fase -eq 'Download' -and -not $a.SemDados) { $velDl += [double]$a.VelDl }
+            $baixadosAtivos += [double]$a.Transferidos
+        }
+        catch {
+            Write-Verbose ('Progresso de {0} não atualizado: {1}' -f $chave, $_.Exception.Message)
+            $info = @{ Fracao = [double]0; Pct = -1; Texto = 'em andamento'; Curto = 'em andamento' }
+            $am = $Painel.Amostras[$chave]
+            if ($null -ne $am) { $info.Fracao = [double]$am.FracaoMax }
+        }
+        $pesoAndamento += [double]$peso * [double]$info.Fracao
+        $ativos.Add([pscustomobject]@{ Id = $chave; Info = $info })
     }
     $fracao = [math]::Max([double]0, [math]::Min([double]1, ($Painel.PesoConcluido + $pesoAndamento) / $Painel.PesoTotal))
     $pct = [int][math]::Floor(100 * $fracao)
     $decorrido = ($agora - $Painel.Inicio).TotalSeconds
+    # Tempo restante pelo ritmo desta execução: o que já estava pronto ao começar (resto de .part retomado, .7z
+    # reaproveitado) não conta como trabalho feito agora. Com pouco trabalho feito, a estimativa ainda não vale.
+    $feito = $fracao - [math]::Min($fracao, $pesoGratis / $Painel.PesoTotal)
     $restante = [double]-1
-    if ($fracao -ge 0.01 -and $decorrido -ge 5) { $restante = $decorrido * (1 - $fracao) / $fracao }
+    if (($decorrido -ge 5 -and $feito -ge 0.01) -or ($decorrido -ge 15 -and $feito -ge 0.002)) { $restante = $decorrido * (1 - $fracao) / $feito }
     $baixados = $Painel.Baixados + $baixadosAtivos
     $naFila = [math]::Max(0, $Painel.Total - $Painel.Concluidos - $ativos.Count)
 
-    $arquivos = '{0} de {1} arquivos' -f $Painel.Concluidos, $Painel.Total
+    $arquivos = Format-ContagemArquivos -Feitos $Painel.Concluidos -Total $Painel.Total
     if ($Painel.Erros -gt 0) { $arquivos += (' ({0} com erro)' -f $Painel.Erros) }
     $partes = New-Object System.Collections.Generic.List[string]
     $partes.Add(('{0}%' -f $pct))
     $partes.Add($arquivos)
     if ($velDl -gt 0) { $partes.Add(('{0}/s' -f (Format-Bytes $velDl))) }
-    if ($restante -ge 0) { $partes.Add(('faltam ~{0}' -f (Format-Duracao $restante))) }
-    else { $partes.Add('calculando o tempo restante') }
+    if ($Painel.Concluidos -lt $Painel.Total) {
+        if ($restante -ge 0) { $partes.Add((Format-Faltam $restante)) }
+        else { $partes.Add('calculando o tempo restante') }
+    }
     $status = $partes -join ' | '
-    $operacao = 'decorrido {0} | baixados {1} | {2} em andamento | {3} na fila' -f (Format-Duracao $decorrido), (Format-Bytes $baixados), $ativos.Count, $naFila
+
+    # Quais arquivos ganham barra própria: no painel clássico só os que cabem na janela, começando pelos que já
+    # têm uma (a tela não troca de arquivo a cada segundo). Os demais vão para a linha de baixo da barra geral.
+    $limite = -1
+    try { $limite = Get-LimiteBarrasArquivo -Classico ([bool]$Painel.Classico) } catch { $limite = -1 }
+    $comBarra = New-Object System.Collections.Generic.List[object]
+    $semBarra = New-Object System.Collections.Generic.List[object]
+    foreach ($x in @($ativos | Sort-Object -Property @{ Expression = { if ($Painel.Slots.ContainsKey($_.Id)) { [int]$Painel.Slots[$_.Id] } else { 1000 } } })) {
+        if ($limite -lt 0 -or $comBarra.Count -lt $limite) { $comBarra.Add($x) } else { $semBarra.Add($x) }
+    }
+    if ($semBarra.Count -gt 0) {
+        $outros = @($semBarra | ForEach-Object { '{0} {1}' -f $_.Id, $_.Info.Curto }) -join ' | '
+        $operacao = 'decorrido {0} | baixados {1} | {2} na fila | {3}' -f (Format-Duracao $decorrido), (Format-Bytes $baixados), $naFila, $outros
+    }
+    else {
+        $operacao = 'decorrido {0} | baixados {1} | {2} em andamento | {3} na fila' -f (Format-Duracao $decorrido), (Format-Bytes $baixados), $ativos.Count, $naFila
+    }
 
     $Painel.UltimoPai = @{ Status = $status; Operacao = $operacao; Pct = $pct }
     try {
         Write-Progress -Id 1 -Activity $Painel.Atividade -Status $status -CurrentOperation $operacao -PercentComplete $pct
-        # Uma barra por arquivo em andamento; as posições (Id) são reaproveitadas quando um arquivo termina.
+        # Uma barra por arquivo; as posições (Id) são reaproveitadas quando um arquivo termina ou sai da tela.
         $vistos = @{}
-        foreach ($x in $ativos) {
+        foreach ($x in $comBarra) { $vistos[$x.Id] = $true }
+        foreach ($id in @($Painel.Slots.Keys)) {
+            if (-not $vistos.ContainsKey($id)) {
+                Write-Progress -Id (10 + [int]$Painel.Slots[$id]) -ParentId 1 -Activity $id -Completed
+                $Painel.Slots.Remove($id)
+            }
+        }
+        foreach ($x in $comBarra) {
             if (-not $Painel.Slots.ContainsKey($x.Id)) {
                 $usados = @{}
                 foreach ($v in @($Painel.Slots.Values)) { $usados[[int]$v] = $true }
@@ -3228,15 +3429,8 @@ function Show-PainelProgresso {
                 while ($usados.ContainsKey($slot)) { $slot++ }
                 $Painel.Slots[$x.Id] = $slot
             }
-            $vistos[$x.Id] = $true
         }
-        foreach ($id in @($Painel.Slots.Keys)) {
-            if (-not $vistos.ContainsKey($id)) {
-                Write-Progress -Id (10 + [int]$Painel.Slots[$id]) -ParentId 1 -Activity $id -Completed
-                $Painel.Slots.Remove($id)
-            }
-        }
-        foreach ($x in @($ativos | Sort-Object -Property @{ Expression = { [int]$Painel.Slots[$_.Id] } })) {
+        foreach ($x in @($comBarra | Sort-Object -Property @{ Expression = { [int]$Painel.Slots[$_.Id] } })) {
             Write-Progress -Id (10 + [int]$Painel.Slots[$x.Id]) -ParentId 1 -Activity $x.Id -Status $x.Info.Texto -PercentComplete $x.Info.Pct
         }
     }
@@ -3255,14 +3449,20 @@ function Show-PainelProgresso {
 function Register-ItemConcluido {
     <# Arquivo coletado: passa a contar inteiro no percentual e a barra dele sai da tela. #>
     param([hashtable]$Painel, [string]$Id, $Est, [bool]$Erro)
+    $amostra = $Painel.Amostras[$Id]
     $peso = $Painel.Pesos[$Id]
-    if ($null -ne $peso) { $Painel.PesoConcluido = [double]$Painel.PesoConcluido + [double]$peso }
+    if ($null -ne $peso) {
+        $Painel.PesoConcluido = [double]$Painel.PesoConcluido + [double]$peso
+        if ($null -ne $amostra) { $Painel.PesoGratisConcluido = [double]$Painel.PesoGratisConcluido + [double]$peso * [double]$amostra.Gratis }
+    }
     $Painel.Concluidos = [int]$Painel.Concluidos + 1
     if ($Erro) { $Painel.Erros = [int]$Painel.Erros + 1 }
     $transferidos = [double]0
     if ($null -ne $Est -and $null -ne $Est.Transferidos) { $transferidos = [double]$Est.Transferidos }
-    elseif ($Painel.Amostras.ContainsKey($Id)) { $transferidos = [double]$Painel.Amostras[$Id].Transferidos }
+    elseif ($null -ne $amostra) { $transferidos = [double]$amostra.Transferidos }
     $Painel.Baixados = [double]$Painel.Baixados + $transferidos
+    # Períodos de download do arquivo (média do resumo final).
+    if ($null -ne $Est -and $null -ne $Est.Downloads) { foreach ($p in @($Est.Downloads)) { $Painel.Intervalos.Add($p) } }
     $Painel.Amostras.Remove($Id)
     if ($Painel.Slots.ContainsKey($Id)) {
         try { Write-Progress -Id (10 + [int]$Painel.Slots[$Id]) -ParentId 1 -Activity $Id -Completed } catch { }
@@ -3270,14 +3470,36 @@ function Register-ItemConcluido {
     }
 }
 
+function Get-SegundosComDownload {
+    <# Tempo com ao menos um download ativo: união dos períodos de download (eles se sobrepõem com -Paralelismo > 1). #>
+    param($Intervalos)
+    # Sem @($Intervalos): no PowerShell 7.4, @() direto sobre uma List[object] lança "Argument types do not match".
+    $lista = @($Intervalos | Where-Object { $null -ne $_ } | Sort-Object -Property @{ Expression = { [long]$_.Inicio } })
+    $soma = [double]0
+    $ini = [long]-1
+    $fim = [long]-1
+    foreach ($p in $lista) {
+        $a = [long]$p.Inicio
+        $b = [long]$p.Fim
+        if ($b -lt $a) { continue }
+        if ($ini -lt 0) { $ini = $a; $fim = $b }
+        elseif ($a -le $fim) { if ($b -gt $fim) { $fim = $b } }
+        else { $soma += ($fim - $ini) / 1e7; $ini = $a; $fim = $b }
+    }
+    if ($ini -ge 0) { $soma += ($fim - $ini) / 1e7 }
+    return $soma
+}
+
 function Write-ResumoPainel {
-    <# Linha final do download/ETL: tempo total, arquivos, erros e volume baixado. #>
+    <# Linha final do download/ETL: tempo total, arquivos, erros, volume baixado e a média durante os downloads. #>
     param([hashtable]$Painel)
     $decorrido = ([DateTime]::UtcNow - $Painel.Inicio).TotalSeconds
-    $txt = 'Download e ETL concluídos em {0}: {1} de {2} arquivos' -f (Format-Duracao $decorrido), $Painel.Concluidos, $Painel.Total
+    $txt = 'Download e ETL concluídos em {0}: {1}' -f (Format-Duracao $decorrido), (Format-ContagemArquivos -Feitos $Painel.Concluidos -Total $Painel.Total)
     if ($Painel.Erros -gt 0) { $txt += (' ({0} com erro)' -f $Painel.Erros) }
     $txt += ('; {0} baixados' -f (Format-Bytes $Painel.Baixados))
-    if ($decorrido -ge 1 -and $Painel.Baixados -gt 0) { $txt += (' ({0}/s em média)' -f (Format-Bytes ($Painel.Baixados / $decorrido))) }
+    # Média só sobre o tempo com download ativo (o ETL do último arquivo não entra na conta da rede).
+    $tempoDl = Get-SegundosComDownload -Intervalos $Painel.Intervalos
+    if ($tempoDl -ge 0.5 -and $Painel.Baixados -gt 0) { $txt += (' ({0}/s em média nos downloads)' -f (Format-Bytes ($Painel.Baixados / $tempoDl))) }
     $nivel = 'OK'
     if ($Painel.Erros -gt 0) { $nivel = 'AVISO' }
     Write-Log ($txt + '.') $nivel
@@ -3315,7 +3537,7 @@ function Invoke-Execucao {
     $tarefas = New-Object System.Collections.Generic.List[object]
     $concluidas = 0
     $total = $Itens.Count
-    $painel = New-PainelProgresso -Itens $Itens -Atividade $Atividade -IntervaloTexto $IntervaloProgresso
+    $painel = New-PainelProgresso -Itens $Itens -Atividade $Atividade -IntervaloTexto $IntervaloProgresso -ComContador ([bool]$Cfg.TipoContador)
     $ondeManifesto = 'Principal'   # destino da última gravação do manifesto: Principal | Pendente | Nenhum
     try {
         foreach ($item in $Itens) {
@@ -3488,6 +3710,17 @@ function Get-AssinaturaConteudo {
     return ($Assinatura -replace '\|Gz=\d\|Bom=\d$', '')
 }
 
+function Get-BytesConsolidacao {
+    <# Bytes dos arquivos que a consolidação do grupo vai ler (percentual da etapa de consolidação). #>
+    param([object[]]$Linhas, [hashtable]$Cfg)
+    $soma = [double]0
+    foreach ($l in @($Linhas | Where-Object { $_.status -eq 'OK' })) {
+        $caminho = Resolve-ArquivoSaida -Linha $l -Cfg $Cfg
+        if ($caminho) { try { $soma += [double](Get-Item -LiteralPath $caminho -ErrorAction Stop).Length } catch { } }
+    }
+    return $soma
+}
+
 function Merge-Consolidado {
     <#
         Concatena as saídas de um grupo num único CSV (cabeçalho uma vez), em streaming de bytes. Só consolida
@@ -3495,7 +3728,8 @@ function Merge-Consolidado {
     #>
     param(
         [string]$Grupo, [object[]]$Linhas, [hashtable]$Cfg, [hashtable]$IdsListados,
-        [string]$Rotulo = 'Consolidação', [int]$Indice = 1, [int]$TotalGrupos = 1
+        [string]$Rotulo = 'Consolidação', [int]$Indice = 1, [int]$TotalGrupos = 1,
+        [double]$BytesAntes = 0, [double]$BytesEtapa = 0
     )
     $linhasOk = @($Linhas | Where-Object { $_.status -eq 'OK' } | Sort-Object periodo, regiao)
     if ($linhasOk.Count -eq 0) { return }
@@ -3585,9 +3819,11 @@ function Merge-Consolidado {
                     if (([DateTime]::UtcNow - $marca).TotalMilliseconds -ge 1000) {
                         $marca = [DateTime]::UtcNow
                         $lidos = $feitos + [double]$fsIn.Position
-                        $fracaoGrupo = $lidos / [math]::Max([double]1, $totalBytes)
                         $txt = '{0} (grupo {1} de {2}) | arquivo {3} de {4} | {5} de {6}' -f $Grupo, $Indice, $TotalGrupos, $k, $arquivos.Count, (Format-Bytes $lidos), (Format-Bytes $totalBytes)
-                        Write-ProgressoEtapa -Atividade $Rotulo -Status $txt -Fracao ((($Indice - 1) + $fracaoGrupo) / [math]::Max(1, $TotalGrupos))
+                        # Percentual da etapa pelos bytes de todos os grupos (a RAIS_VINC pesa bem mais que o CAGED_EXC).
+                        if ($BytesEtapa -gt 0) { $fracaoEtapa = [math]::Min([double]1, ($BytesAntes + $lidos) / $BytesEtapa) }
+                        else { $fracaoEtapa = (($Indice - 1) + $lidos / [math]::Max([double]1, $totalBytes)) / [math]::Max(1, $TotalGrupos) }
+                        Write-ProgressoEtapa -Atividade $Rotulo -Status $txt -Fracao $fracaoEtapa
                     }
                 }
             }
@@ -3705,13 +3941,13 @@ function Write-Resumo {
             $m = [decimal]0; if ([decimal]::TryParse([string]$l.metrica_soma, [System.Globalization.NumberStyles]::Number, $inv, [ref]$m)) { $somaMetrica += $m }
         }
         [pscustomobject]@{
-            Grupo     = $g
-            OK        = @($doGrupo | Where-Object { $_.status -eq 'OK' }).Count
-            SemDados  = @($doGrupo | Where-Object { $_.status -eq 'SEM_DADOS' }).Count
-            Erro      = @($doGrupo | Where-Object { $_.status -eq 'ERRO' }).Count
-            Periodos  = ('{0} a {1}' -f (@($doGrupo | Sort-Object periodo)[0].periodo), (@($doGrupo | Sort-Object periodo)[-1].periodo))
-            Linhas    = $somaLinhas.ToString('N0')
-            Metrica   = $Script:MetaGrupos[$g].Metrica
+            Grupo       = $g
+            OK          = @($doGrupo | Where-Object { $_.status -eq 'OK' }).Count
+            SemDados    = @($doGrupo | Where-Object { $_.status -eq 'SEM_DADOS' }).Count
+            Erro        = @($doGrupo | Where-Object { $_.status -eq 'ERRO' }).Count
+            Periodos    = ('{0} a {1}' -f (@($doGrupo | Sort-Object periodo)[0].periodo), (@($doGrupo | Sort-Object periodo)[-1].periodo))
+            Linhas      = $somaLinhas.ToString('N0')
+            Metrica     = $Script:MetaGrupos[$g].Metrica
             SomaMetrica = $somaMetrica.ToString('N0')
         }
     }
@@ -3808,6 +4044,8 @@ try {
         throw ('O PowerShell está em {0} (AppLocker/WDAC). O script precisa de FullLanguage para usar tipos .NET.' -f $ExecutionContext.SessionState.LanguageMode)
     }
 
+    # "~" = pasta do usuário ($HOME, o mesmo do padrão de -Saida); é o padrão das tarefas do VS Code.
+    if ($Saida -match '^~(?=$|[\\/])') { $Saida = $HOME + $Saida.Substring(1) }
     $Saida = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Saida)
     # Caminho relativo do 7-Zip: o Process.Start resolve pela pasta do PROCESSO, não pela pasta atual do PowerShell.
     # Unidade inexistente na sessão (rede não mapeada no Agendador, pendrive removido): mantém o texto; o
@@ -3934,6 +4172,14 @@ try {
     $volume = '{0} para baixar' -f (Format-Bytes $bytesBaixar)
     if ($baixarSemTamanho -gt 0) { $volume = '{0} + {1} arquivo(s) de tamanho desconhecido' -f $volume, $baixarSemTamanho }
     Write-Log ('Encontrados {0} arquivo(s) no FTP; {1} a processar ({2}); {3} já em dia.' -f $itens.Count, $aProcessar.Count, $volume, ($itens.Count - $aProcessar.Count))
+    if ($aProcessar.Count -gt 0) {
+        $motivos = @($aProcessar | Group-Object -Property Situacao | Sort-Object -Property Count -Descending | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Count })
+        Write-Log ('Motivos: {0}.' -f ($motivos -join '; '))
+        $porConfiguracao = @($aProcessar | Where-Object { $_.Situacao -eq 'Configuração alterada' }).Count
+        if ($porConfiguracao -gt 0) {
+            Write-Log ('{0} arquivo(s) desta pasta foram gerados com outra configuração (-CompactarSaida, -Cabecalho, -Delimitador, -SeparadorDecimal, -ManterValoresBrutos, -SemBOM ou versão anterior do script): vão ser processados de novo, com novo download se o .7z não estiver em _downloads. Para manter as duas versões, use outra -Saida.' -f $porConfiguracao) 'AVISO'
+        }
+    }
     foreach ($g in $grupos) {
         if (@($itens | Where-Object { $_.Grupo -eq $g }).Count -eq 0) { Write-Log ('Nenhum arquivo de {0} encontrado no período {1}-{2}.' -f $g, $AnoInicial, $AnoFinal) 'AVISO' }
     }
@@ -3997,12 +4243,25 @@ try {
                 $idsListados = @{}
                 foreach ($it in $itens) { $idsListados[[string]$it.Id] = $true }
                 $rotuloConsolidacao = & $rotuloEtapa 3
+                # Percentual da etapa pelos bytes a ler em todos os grupos.
+                $bytesGrupo = @{}
+                $bytesEtapa = [double]0
+                foreach ($g in $grupos) {
+                    $b = [double]0
+                    try { $b = Get-BytesConsolidacao -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg } catch { }
+                    $bytesGrupo[$g] = $b
+                    $bytesEtapa += $b
+                }
+                $bytesAntes = [double]0
                 $gi = 0
                 foreach ($g in $grupos) {
                     $gi++
-                    Write-ProgressoEtapa -Atividade $rotuloConsolidacao -Status ('{0} (grupo {1} de {2})' -f $g, $gi, $grupos.Count) -Fracao (($gi - 1) / [math]::Max(1, $grupos.Count))
-                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg -IdsListados $idsListados -Rotulo $rotuloConsolidacao -Indice $gi -TotalGrupos $grupos.Count }
+                    $fracaoInicio = $bytesAntes / [math]::Max([double]1, $bytesEtapa)
+                    if ($bytesEtapa -le 0) { $fracaoInicio = ($gi - 1) / [math]::Max(1, $grupos.Count) }
+                    Write-ProgressoEtapa -Atividade $rotuloConsolidacao -Status ('{0} (grupo {1} de {2})' -f $g, $gi, $grupos.Count) -Fracao $fracaoInicio
+                    try { Merge-Consolidado -Grupo $g -Linhas @($manifesto.Values | Where-Object { $_.grupo -eq $g }) -Cfg $cfg -IdsListados $idsListados -Rotulo $rotuloConsolidacao -Indice $gi -TotalGrupos $grupos.Count -BytesAntes $bytesAntes -BytesEtapa $bytesEtapa }
                     catch { Write-Log ('Consolidação de {0} falhou: {1}' -f $g, $_.Exception.Message) 'ERRO'; $codigoSaida = 1 }
+                    $bytesAntes += [double]$bytesGrupo[$g]
                 }
                 Write-ProgressoEtapa -Atividade $rotuloConsolidacao -Concluir
             }
@@ -4013,7 +4272,10 @@ try {
     if ($codigoSaida -eq 0 -and ($Script:ListagemIncompleta -or $Script:ErroControle)) { $codigoSaida = 1 }
     if ($Script:ListagemIncompleta) { Write-Log 'Alguma pasta do FTP não pôde ser listada (veja os ERROs acima); os arquivos dela ficam para a próxima execução.' 'AVISO' }
     $duracao = (Get-Date) - $Script:Inicio
-    Write-Log ('Fim. Duração: {0:hh\:mm\:ss}. Manifesto: {1}' -f $duracao, $caminhoManifesto) 'OK'
+    $sentidoCodigo = 'sucesso'
+    $nivelFim = 'OK'
+    if ($codigoSaida -ne 0) { $sentidoCodigo = 'algo ficou pendente: veja os AVISOs e ERROs acima'; $nivelFim = 'AVISO' }
+    Write-Log ('Fim. Duração: {0:hh\:mm\:ss}. Código de saída: {1} ({2}). Manifesto: {3}' -f $duracao, $codigoSaida, $sentidoCodigo, $caminhoManifesto) $nivelFim
     $terminou = $true
 }
 catch {

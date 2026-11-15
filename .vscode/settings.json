@@ -1,12 +1,17 @@
 {
-    // pipeline_rais_caged.ps1 precisa continuar em UTF-8 COM BOM: sem o BOM, o Windows PowerShell 5.1
-    // lê os acentos errado. O VS Code mantém o BOM dos arquivos que já têm; esta linha garante o mesmo
-    // para arquivos .ps1 novos ou salvos sem BOM por outro editor.
+    // pipeline_rais_caged.ps1 precisa continuar em UTF-8 COM BOM: sem o BOM, o Windows PowerShell 5.1 lê os acentos
+    // errado. O VS Code mantém o BOM dos arquivos que já o têm, e a linha abaixo faz os .ps1 NOVOS nascerem com BOM.
+    // Um .ps1 que perdeu o BOM (salvo por outro editor) só volta a tê-lo com "Save with Encoding" > "UTF-8 with BOM"
+    // (guia: docs/rais_caged_mg.md, seção 16).
     "[powershell]": {
         "files.encoding": "utf8bom",
         "editor.tabSize": 4,
         "editor.insertSpaces": true
     },
-    // Mesmo estilo do script: chave de abertura na mesma linha.
-    "powershell.codeFormatting.preset": "OTBS"
+    // Mesmo estilo do script: chave de abertura na mesma linha; else, elseif, catch e finally na linha de baixo do "}".
+    // Com ele, "Format Document" não altera o pipeline_rais_caged.ps1.
+    "powershell.codeFormatting.preset": "Stroustrup",
+    // F5 roda o script com "&" (escopo próprio), e não com "." (dot-source, o padrão da extensão): o StrictMode, o
+    // $ErrorActionPreference = 'Stop' e as funções do script não ficam valendo no terminal depois da depuração.
+    "powershell.debugging.executeMode": "Call"
 }

@@ -65,7 +65,8 @@ Só uma execução por vez usa a mesma pasta de saída (trava em `_controle\exec
 
 ```powershell
 # 1) Baixe o script (ou clone o repositório; para usar no VS Code, veja a seção 16).
-#    Enquanto o PR não for mesclado, troque "main" por "claude/eager-euler-vzxla1" na URL abaixo.
+#    Enquanto o PR #1 não for mesclado, o script só existe no branch claude/eager-euler-vzxla1:
+#    troque "main" por "claude/eager-euler-vzxla1" na URL abaixo.
 Invoke-WebRequest -UseBasicParsing -OutFile .\pipeline_rais_caged.ps1 `
     -Uri 'https://raw.githubusercontent.com/mazoir/dados_publicos/main/pipeline_rais_caged.ps1'
 
@@ -87,12 +88,15 @@ A ajuda completa fica no próprio script: `Get-Help .\pipeline_rais_caged.ps1 -F
 
 ### O que aparece na tela
 
-As mensagens do log rolam normalmente e, junto delas, ficam as barras de progresso. Durante o download e o ETL há uma barra geral e, abaixo dela, uma por arquivo em andamento. No **Windows PowerShell 5.1** o painel fica no topo da janela:
+As mensagens do log rolam normalmente e, junto delas, ficam as barras de progresso. Durante o download e o ETL há uma barra geral e, abaixo dela, uma por arquivo em andamento. O rótulo diz a etapa: "Etapa 2 de 3" com `-Consolidar`, "Etapa 2 de 2" sem ele.
+
+No **Windows PowerShell 5.1** o painel fica no topo da janela. Com a janela maximizada (42 linhas ou mais, para os 3 arquivos em paralelo do padrão):
 
 ```
  Etapa 2 de 3: download e ETL (MG)
     45% | 14 de 31 arquivos | 3,4 MB/s | faltam ~6 min 30 s
     [ooooooooooooooooooooooooooooooooo                                           ]
+
     decorrido 5 min 12 s | baixados 1,20 GB | 3 em andamento | 14 na fila
    CAGED_MOV_202401
       baixando 45% | 12,3 MB de 27,1 MB | 2,1 MB/s | faltam ~7 s
@@ -100,24 +104,44 @@ As mensagens do log rolam normalmente e, junto delas, ficam as barras de progres
    RAIS_VINC_2023_MG_ES_RJ
       processando 38% | 1.234.567 linhas | 198.789 linhas/s | faltam ~1 min 40 s
       [ooooooooooooooooo                                                       ]
+   RAIS_ESTAB_2023
+      baixando 12% | 4,1 MB de 33,8 MB | 1,2 MB/s | faltam ~25 s
+      [oooooooo                                                                ]
 ```
 
-No **PowerShell 7** cada barra ocupa uma linha, no pé do terminal (o texto fica dentro da barra, que se preenche):
+O 5.1 reserva às barras no máximo 1/3 da altura da janela, e o que não cabe ele "comprime": some o desenho da barra e o percentual sai repetido. Por isso o script mostra sempre a barra geral e só as barras de arquivo que cabem: nenhuma em janelas com menos de 24 linhas (é o caso do painel do terminal do VS Code, em geral), uma de 24 a 32 linhas e duas de 33 a 41. Os arquivos sem barra aparecem na linha de baixo da barra geral, com o que estão fazendo:
+
+```
+ Etapa 2 de 3: download e ETL (MG)
+    45% | 14 de 31 arquivos | 3,4 MB/s | faltam ~6 min 30 s
+    [ooooooooooooooooooooooooooooooooo                                           ]
+
+    decorrido 5 min 12 s | baixados 1,20 GB | 14 na fila | CAGED_MOV_202401 baixando 45% | RAIS_VINC_2023_MG_ES_RJ processando 38% | ...
+```
+
+Para ver todas as barras no 5.1, maximize a janela (no VS Code, maximize o painel do terminal ou arraste-o para a área do editor) ou use o PowerShell 7.
+
+No **PowerShell 7** cada barra ocupa uma linha, no pé do terminal, em qualquer tamanho de janela (o texto fica dentro da barra, que se preenche):
 
 ```
 Etapa 2 de 3: download e ETL (MG) [45% | 14 de 31 arquivos | 3,4 MB/s | faltam ~6 min 30 s          ]
   CAGED_MOV_202401 [baixando 45% | 12,3 MB de 27,1 MB | 2,1 MB/s | faltam ~7 s                       ]
   RAIS_VINC_2023_MG_ES_RJ [processando 38% | 1.234.567 linhas | 198.789 linhas/s | faltam ~1 min 40 s]
+  RAIS_ESTAB_2023 [baixando 12% | 4,1 MB de 33,8 MB | 1,2 MB/s | faltam ~25 s                        ]
 ```
 
-- **Percentual geral:** cada arquivo pesa o seu tamanho no FTP; metade é o download e metade o ETL. O tempo restante é uma estimativa pelo ritmo desde o início da etapa ("calculando" nos primeiros segundos).
-- **Barra do arquivo:** no download, o percentual baixado e a velocidade; no ETL, o percentual do arquivo descompactado já lido, as linhas lidas e as linhas por segundo. Com o motor PowerShell (contingência), o ETL mostra só as linhas.
-- **Listagem do FTP e consolidação** têm barra própria ("Etapa 1 de 3", "Etapa 3 de 3"), com a pasta ou o arquivo da vez.
-- **No log:** a cada 60 s (parâmetro `-IntervaloProgresso`) vai uma linha com o mesmo resumo, útil nas execuções agendadas, em que ninguém vê a janela. Cada arquivo concluído traz a contagem (`OK - ... [14 de 31]`) e o fim do download/ETL traz tempo total, erros e volume baixado:
+- **Percentual geral:** cada arquivo pesa o seu tamanho no FTP; metade é o download e metade o ETL. Ele só avança: um arquivo que recomeça (ex.: `.7z` danificado, baixado de novo) fica parado na barra geral até passar do ponto em que estava.
+- **Tempo restante:** estimativa pelo ritmo desta execução, sem contar o que já estava pronto ao começar (resto de `.part` retomado, `.7z` reaproveitado). Mostra "calculando o tempo restante" até haver trabalho suficiente para estimar (5 s e 1% do total, ou 15 s e 0,2%): na primeira carga completa de MG, com vários GB, isso pode levar um ou dois minutos.
+- **Barra do arquivo:** no download, o percentual baixado, a velocidade e quanto falta; se nada chega do FTP por 10 s, a velocidade dá lugar a "aguardando dados do FTP há ...". No ETL, o percentual do arquivo descompactado já lido, as linhas lidas, as linhas por segundo e quanto falta. Com o motor PowerShell (contingência), o percentual do ETL é estimado pelas linhas lidas e aparece com "~" (ex.: `processando ~40%`).
+- **Listagem do FTP e consolidação** têm barra própria ("Etapa 1 de 3", "Etapa 3 de 3"), com a pasta ou o arquivo da vez. Na consolidação, o percentual é pelos bytes de todos os grupos.
+- **No log:** a cada 60 s (parâmetro `-IntervaloProgresso`), em todas as etapas, vai uma linha "Progresso:" com o mesmo resumo, útil nas execuções agendadas, em que ninguém vê a janela. Cada arquivo concluído traz a contagem (`OK - ... [14 de 31]`); o fim do download/ETL traz tempo total, erros, volume baixado e a média de velocidade durante os downloads; e a última linha traz o código de saída:
 
 ```
+2026-11-15 14:00:31 [INFO ] Progresso: Etapa 1 de 3: listagem do FTP (MG) | 62% | NOVO CAGED/2024/202407 (mês 7 de 12) | 41 pasta(s) listada(s) | 140 arquivo(s) do período | decorrido 1 min 00 s
 2026-11-15 14:05:12 [INFO ] Progresso: 45% | 14 de 31 arquivos | 3,4 MB/s | faltam ~6 min 30 s | baixados 1,20 GB | decorrido 5 min 12 s | em andamento: CAGED_MOV_202401 baixando 45%, RAIS_VINC_2023_MG_ES_RJ processando 38%
-2026-11-15 14:11:40 [OK   ] Download e ETL concluídos em 11 min 40 s: 31 de 31 arquivos; 2,71 GB baixados (3,9 MB/s em média).
+2026-11-15 14:11:40 [OK   ] Download e ETL concluídos em 11 min 40 s: 31 de 31 arquivos; 2,71 GB baixados (4,6 MB/s em média nos downloads).
+2026-11-15 14:12:41 [INFO ] Progresso: Etapa 3 de 3: consolidação (MG) | 37% | RAIS_VINC (grupo 1 de 5) | arquivo 4 de 6 | 2,1 GB de 5,6 GB | decorrido 1 min 00 s
+2026-11-15 14:14:20 [OK   ] Fim. Duração: 00:14:20. Código de saída: 0 (sucesso). Manifesto: C:\Users\voce\Dados\MTE\_controle\manifesto_MG.csv
 ```
 
 ---
@@ -150,7 +174,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 
 | Parâmetro | Padrão | Descrição |
 | --- | --- | --- |
-| `-Saida` | `$HOME\Dados\MTE` | Pasta raiz de saída |
+| `-Saida` | `$HOME\Dados\MTE` | Pasta raiz de saída. Aceita `~` para a pasta do usuário: `~\Dados\MTE` é o mesmo que o padrão |
 | `-AnoInicial` | `2020` | Primeiro ano. Na RAIS é o ano-base; no CAGED, o ano da competência do arquivo. Mínimo 2020, quando começa o Novo CAGED |
 | `-AnoFinal` | ano corrente | Último ano. A RAIS do ano corrente ainda não existe e é ignorada |
 | `-Bases` | `RAIS,CAGED` | `RAIS`, `CAGED` ou os grupos `RAIS_VINC`, `RAIS_ESTAB`, `CAGED_MOV`, `CAGED_FOR`, `CAGED_EXC`. Aceita lista ou texto com vírgulas |
@@ -171,7 +195,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps
 | `-UsarProxySistema` | desligado | Usa o proxy do sistema para o FTP. **Só tem efeito no Windows PowerShell 5.1** (o .NET do PowerShell 7 não usa proxy em FTP). Pelo proxy, o FTP não informa tamanho nem data: um download interrompido recomeça do zero, o download não é conferido pelo tamanho, com `-Reprocessar` os `.7z` guardados por `-ManterCompactados` são baixados de novo e republicações do MTE **não são detectadas** (rode com `-Reprocessar` de tempos em tempos). O total "para baixar" do log e a estimativa de espaço livre não contam esses arquivos (aparecem como "de tamanho desconhecido"). Alternar entre conexão direta e proxy na mesma pasta não marca nada como republicado; só os arquivos processados apenas pelo proxy são reprocessados uma vez, na primeira execução com conexão direta (o manifesto não tinha tamanho e data para comparar) |
 | `-FtpBase` | `ftp://ftp.mtps.gov.br/pdet/microdados` | Raiz dos microdados. Num espelho com listagem Unix, um arquivo publicado como link simbólico vem sem tamanho: a republicação só é detectada quando a data do link muda de dia, o download não é conferido pelo tamanho e, se interrompido, recomeça do zero (o log avisa; rode com `-Reprocessar` de tempos em tempos). O FTP do MTE não tem esse problema |
 | `-Tentativas` | `5` | Tentativas por listagem ou download, de 1 a 20 |
-| `-IntervaloProgresso` | `60` | Segundos entre as linhas "Progresso:" no log e no console, de 0 a 3600 (0 desliga). A barra da janela é atualizada a cada segundo, qualquer que seja o valor |
+| `-IntervaloProgresso` | `60` | Segundos entre as linhas "Progresso:" no log e no console, em todas as etapas (listagem, download e ETL, consolidação), de 0 a 3600 (0 desliga). A barra da janela é atualizada a cada segundo, qualquer que seja o valor |
 | `-SomenteListar` | desligado | Simulação: lista o que seria baixado e processado |
 
 **Códigos de saída:**
@@ -568,7 +592,7 @@ Register-ScheduledTask -TaskName 'MTE - RAIS e Novo CAGED (MG)' -Action $acao -T
     -Description 'Atualiza incrementalmente RAIS e Novo CAGED filtrados para MG'
 ```
 
-O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada, manifesto ou mapeamento bloqueado ou ilegível), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada. Cada execução grava o próprio log (o nome leva data, hora e PID). Como a tarefa agendada roda sem janela, o andamento fica nas linhas "Progresso:" do log (a cada `-IntervaloProgresso` segundos); no VS Code, a tarefa "MTE 5 - Acompanhar o log mais recente" mostra essas linhas ao vivo ([seção 16](#16-vs-code-abrir-rodar-e-depurar)).
+O resultado da última execução aparece no Agendador com os códigos da [seção 5](#5-parâmetros): `0` = sucesso, `1` = algo pendente (arquivos em erro, pasta do FTP não listada, consolidação recusada, manifesto ou mapeamento bloqueado ou ilegível), `2` = falha geral, outra execução na mesma pasta ou interrupção. O log detalhado fica em `<Saida>\_controle\logs`. Se a tarefa disparar enquanto uma execução manual ainda roda na mesma pasta, ela sai na hora com código `2`, sem mexer em nada. Cada execução grava o próprio log (o nome leva data, hora e PID). Como a tarefa agendada roda sem janela, o andamento fica nas linhas "Progresso:" do log (a cada `-IntervaloProgresso` segundos, em todas as etapas) e a última linha traz o código de saída. No VS Code, a tarefa "MTE 5 - Acompanhar o log mais recente" mostra essas linhas ao vivo: informe nela a mesma pasta da tarefa agendada (no exemplo, `D:\MTE`) ([seção 16](#16-vs-code-abrir-rodar-e-depurar)).
 
 ---
 
@@ -615,9 +639,13 @@ Os números são **ordens de grandeza para MG**. Os exatos de download aparecem 
 | Ctrl+C | A execução para, os downloads parciais (`.part`) ficam para serem retomados (os de tamanho desconhecido, pelo proxy ou de link simbólico, recomeçam do zero) e os CSVs parciais (`.tmp`) são apagados (um que sobrar sai na execução seguinte). O manifesto e o mapeamento já registraram cada arquivo concluído (salvo se o `.pendente.csv` também estava bloqueado: o log avisa). Código de saída `2` |
 | Colunas novas no final do CSV | O MTE publicou uma coluna fora do dicionário. Ela foi preservada; veja `mapeamento_cabecalhos_MG.csv` |
 | A barra de progresso não aparece | `$ProgressPreference` está como `SilentlyContinue` na sessão (volte para `Continue`), a saída está redirecionada para arquivo ou a execução é agendada (sem janela). O andamento continua nas linhas "Progresso:" do log |
-| O painel de progresso cobre as mensagens (Windows PowerShell 5.1) | É o jeito do 5.1 de desenhar as barras: o painel fica no topo da janela e o log rola por baixo. Aumente a altura da janela ou do terminal, ou rode no PowerShell 7 (`pwsh`), em que cada barra ocupa uma linha |
-| A barra do arquivo fica parada em "processando N linhas", sem percentual | Motor PowerShell (contingência, sem o contador de bytes) ou um arquivo cujo tamanho descompactado o 7-Zip não informou. O ETL continua normalmente |
+| Windows PowerShell 5.1 mostra só a barra geral, com os arquivos na linha de baixo dela | A janela (ou o painel do terminal do VS Code) é baixa: o 5.1 reserva às barras no máximo 1/3 da altura e o script mostra só as barras de arquivo que cabem ([o que aparece na tela](#o-que-aparece-na-tela)). Maximize a janela ou o painel, ou use o PowerShell 7 (`pwsh`; no VS Code, as tarefas "- PowerShell 7"), em que cada barra ocupa uma linha. No 5.1 o painel fica no topo da janela e o log rola por baixo dele |
+| A barra do arquivo mostra `processando ~40%` (com "~") | Sem o contador de bytes (motor PowerShell, a contingência), o percentual do ETL é estimado pelas linhas lidas e pelo tamanho médio das linhas do início do arquivo. Se aparecer só "processando N linhas", o 7-Zip não informou o tamanho descompactado. O ETL continua normalmente |
+| A barra do arquivo mostra "aguardando dados do FTP há ..." | Nada chegou do FTP nos últimos 10 s: a conexão está demorando para abrir ou o FTP parou de mandar dados. O script espera até 5 min por leitura e então tenta de novo (`-Tentativas`); se não der, o arquivo fica em erro e volta na próxima execução |
+| "... arquivo(s) desta pasta foram gerados com outra configuração" | A pasta tem saídas de outra configuração (ex.: rodou em CSV e agora com `-CompactarSaida`). Elas são refeitas, com novo download se o `.7z` não estiver em `_downloads`. Para ter as duas versões, use uma `-Saida` para cada |
 | Tarefas e depuração bloqueadas no VS Code | A pasta está no Modo Restrito. Confie nela (aviso no topo ou "Manage Workspace Trust"); veja a [seção 16](#16-vs-code-abrir-rodar-e-depurar) |
+| Tarefa do VS Code não abre: "Path to shell executable ... does not exist" | As tarefas "- PowerShell 7" precisam do `pwsh` instalado (`winget install Microsoft.PowerShell`). As tarefas sem sufixo usam o `powershell.exe`, que vem no Windows |
+| No F5, o ponto de parada no download ou no ETL não para | Esperado: essas etapas rodam em paralelo, em runspaces separados (e o motor padrão é C#). Os pontos de parada valem no fluxo principal ([seção 16](#16-vs-code-abrir-rodar-e-depurar)) |
 
 ---
 
@@ -639,9 +667,9 @@ O repositório traz a pasta `.vscode` pronta: tarefas para rodar o pipeline com 
 
 | Arquivo | O que faz |
 | --- | --- |
-| `.vscode/tasks.json` | Tarefas "MTE 1" a "MTE 5": simulação, teste rápido, carga completa (CSV ou `.gz`) e acompanhamento do log ao vivo |
+| `.vscode/tasks.json` | Tarefas "MTE 1" a "MTE 5" no Windows PowerShell 5.1 (simulação, teste rápido, carga completa em CSV ou `.gz`, log ao vivo) e as de 1 a 4 também no PowerShell 7 |
 | `.vscode/launch.json` | Depuração pela extensão PowerShell: simulação, teste rápido e "com os parâmetros que eu digitar" |
-| `.vscode/settings.json` | Mantém os `.ps1` em **UTF-8 com BOM** (obrigatório para o Windows PowerShell 5.1) e o estilo de formatação do script |
+| `.vscode/settings.json` | Faz os `.ps1` novos nascerem em **UTF-8 com BOM** (obrigatório para o Windows PowerShell 5.1), usa o estilo de formatação do script e roda o F5 em escopo próprio |
 | `.vscode/extensions.json` | Recomenda a extensão **PowerShell** (Microsoft) e a **Rainbow CSV** (para ver os CSVs de saída com colunas alinhadas) |
 
 **1. Trazer o projeto para o computador.** Com o Git instalado, num terminal:
@@ -649,29 +677,42 @@ O repositório traz a pasta `.vscode` pronta: tarefas para rodar o pipeline com 
 ```powershell
 git clone https://github.com/mazoir/dados_publicos.git
 cd dados_publicos
-git checkout claude/eager-euler-vzxla1   # enquanto o PR não for mesclado; depois, fique no main
 code .
 ```
 
-Pelo próprio VS Code: `Ctrl+Shift+P` → **Git: Clone** → cole a URL do repositório → abra a pasta → no canto inferior esquerdo, troque o branch para `claude/eager-euler-vzxla1`. Se preferir baixar o ZIP do branch pelo GitHub, extraia, abra a pasta e rode `Get-ChildItem -Recurse | Unblock-File` no terminal, para o Windows não bloquear os arquivos vindos da internet.
+> **Enquanto o PR #1 não for mesclado**, o script e a pasta `.vscode` só existem no branch `claude/eager-euler-vzxla1`. Depois do `cd dados_publicos`, rode `git checkout claude/eager-euler-vzxla1`; pelo VS Code, troque o branch no canto inferior esquerdo; para baixar o ZIP, escolha esse branch no GitHub. Depois da mesclagem, use o `main` (o branch pode deixar de existir).
+
+Pelo próprio VS Code: `Ctrl+Shift+P` → **Git: Clone** → cole a URL do repositório → abra a pasta. Se preferir baixar o ZIP pelo GitHub (botão **Code** → **Download ZIP**), extraia, abra a pasta e rode `Get-ChildItem -Recurse | Unblock-File` no terminal, para o Windows não bloquear os arquivos vindos da internet.
 
 **2. Preparar o VS Code.**
 - Instale as extensões recomendadas quando o VS Code oferecer (ou procure "PowerShell" da Microsoft na aba de extensões).
 - Confie na pasta (aviso de **Modo Restrito** no topo, ou `Ctrl+Shift+P` → **Workspaces: Manage Workspace Trust**). No Modo Restrito, o VS Code não roda tarefas nem depuração.
-- Confira na barra de status, com o `pipeline_rais_caged.ps1` aberto, que o encoding é **UTF-8 with BOM**. Se aparecer só "UTF-8", clique nele → **Save with Encoding** → **UTF-8 with BOM**.
+- Confira na barra de status, com o `pipeline_rais_caged.ps1` aberto, que o encoding é **UTF-8 with BOM**. Se aparecer só "UTF-8", clique nele → **Save with Encoding** → **UTF-8 with BOM**. A configuração do repositório põe o BOM só em arquivos novos: um `.ps1` que perdeu o BOM em outro editor precisa deste passo.
 
 **3. Rodar pelas tarefas** (`Terminal` → **Run Task...**, ou `Ctrl+Shift+P` → **Tasks: Run Task**):
 
 | Tarefa | O que faz |
 | --- | --- |
-| MTE 1 - Simulação | `-SomenteListar`: lista o FTP e mostra o que seria baixado, sem baixar nada. Comece por ela |
+| MTE 1 - Simulação | `-SomenteListar`: lista o FTP e mostra o que seria baixado nesta pasta e por quê, sem baixar nada. Comece por ela |
 | MTE 2 - Teste rápido | Baixa e processa só o CAGED de exclusões de um ano (poucos MB): confere rede, 7-Zip e ETL em poucos minutos |
-| MTE 3 - Carga completa (CSV) | Bases e período escolhidos, com consolidação por grupo no final. É incremental: rodar de novo só processa o que é novo |
-| MTE 4 - Carga completa (.gz) | Igual à 3, gravando `.csv.gz` (8 a 10 vezes menor) |
-| MTE 5 - Acompanhar o log | Mostra o fim do log mais recente e segue as linhas novas (ex.: uma execução agendada em andamento). Feche pela lixeira do terminal |
+| MTE 3 - Carga completa (CSV) | Bases e período escolhidos, com consolidação por grupo no final. É incremental: na mesma pasta, só processa o que é novo |
+| MTE 4 - Carga completa (.gz) | Como a 3, gravando `.csv.gz` (8 a 10 vezes menor) |
+| MTE 5 - Acompanhar o log | Mostra o fim do log mais recente da pasta e segue as linhas novas (ex.: uma execução agendada em andamento). Feche pela lixeira do terminal |
 
-Ao rodar, o VS Code pergunta, em sequência: qual PowerShell (`powershell.exe` = 5.1, sempre presente no Windows; `pwsh` = 7, se instalado), a pasta de saída, a UF, as bases e o ano inicial; basta Enter para aceitar o padrão. Cada tarefa abre um PowerShell novo num painel próprio do terminal, com o log e as barras de progresso; no fim, o VS Code mostra o código de saída (`0` sucesso, `1` algo pendente, `2` falha: [seção 5](#5-parâmetros)). As tarefas já passam `-ExecutionPolicy Bypass`, então não é preciso mudar a política de execução. Para usar outros parâmetros, rode no terminal do VS Code, por exemplo `.\pipeline_rais_caged.ps1 -Saida D:\MTE -Bases CAGED_MOV -AnoInicial 2024 -Consolidar`.
+As tarefas sem sufixo rodam no **Windows PowerShell 5.1** (`powershell.exe`, que vem no Windows). As de 1 a 4 têm uma versão "**- PowerShell 7**", que precisa do `pwsh` instalado (`winget install Microsoft.PowerShell`) e mostra uma barra por arquivo em qualquer altura de painel. No 5.1, um painel baixo mostra a barra geral e só as barras de arquivo que couberem ([o que aparece na tela](#o-que-aparece-na-tela)): para ver mais, maximize o painel do terminal (botão **Maximize Panel Size**, a seta para cima na barra do painel) ou arraste o terminal para a área do editor.
 
-**4. Depurar (F5).** Na aba **Run and Debug**, escolha uma configuração "MTE" e aperte F5. Dá para pôr pontos de parada no script (clique à esquerda do número da linha) e inspecionar variáveis. A configuração "com os parâmetros que eu digitar" pede a linha de parâmetros. Cada sessão abre um terminal temporário da extensão PowerShell, que usa a versão escolhida na barra de status (clique no número da versão para trocar entre 5.1 e 7). Para cargas longas, prefira as tarefas: a depuração deixa a execução mais lenta.
+Ao rodar, o VS Code pergunta a pasta de saída, a UF, as bases e o ano inicial. A pasta padrão é `~\Dados\MTE`, a mesma do script (`~` = sua pasta de usuário). **Informe sempre a mesma pasta das execuções anteriores**: o controle do que já foi feito (manifesto) é por pasta e, em outra, tudo é baixado e processado de novo. Se você já rodou pelo terminal com outra `-Saida` ou tem uma tarefa agendada (ex.: `D:\MTE`, [seção 12](#12-agendamento-agendador-de-tarefas)), digite essa pasta. Pelo mesmo motivo, escolha CSV (MTE 3) ou `.gz` (MTE 4) e mantenha: alternar as duas na mesma pasta refaz a carga inteira (o log avisa); para ter os dois formatos, use uma pasta para cada.
+
+Cada tarefa abre um PowerShell novo num painel próprio do terminal, com o log e as barras de progresso. A última linha do log traz o código de saída (ex.: `Fim. Duração: 00:14:20. Código de saída: 0 (sucesso)`). Com `1` (algo pendente) ou `2` (falha), o VS Code também escreve "The terminal process ... terminated with exit code: N" ([seção 5](#5-parâmetros)); com `0` ele não escreve nada.
+
+As tarefas já passam `-ExecutionPolicy Bypass`, então não é preciso mudar a política de execução. Para usar outros parâmetros, use a configuração de depuração "com os parâmetros que eu digitar" (passo 4) ou rode num terminal do VS Code assim, o que funciona com qualquer política de execução:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pipeline_rais_caged.ps1 -Saida D:\MTE -Bases CAGED_MOV -AnoInicial 2024 -Consolidar
+```
+
+Rodar `.\pipeline_rais_caged.ps1 ...` direto num terminal novo do Windows PowerShell 5.1 costuma esbarrar na política padrão do Windows (`Restricted`): rode antes `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`, como na [seção 3](#3-primeira-execução-passo-a-passo).
+
+**4. Depurar (F5).** Na aba **Run and Debug**, escolha uma configuração "MTE" e aperte F5. A configuração "com os parâmetros que eu digitar" pede a linha de parâmetros (caminho com espaço vai entre aspas simples). Os pontos de parada (clique à esquerda do número da linha) param no **fluxo principal**: parâmetros, listagem do FTP, manifesto, consolidação e resumo. O download, o 7-Zip e o ETL rodam em paralelo, em runspaces separados (e o motor padrão é C#): ali o depurador não para. Para investigar um problema de dados, use o log, o manifesto e o mapeamento de cabeçalhos em `_controle`. Cada sessão abre um terminal temporário da extensão PowerShell, na versão escolhida no menu de sessão da extensão: clique no ícone `{}` ao lado de "PowerShell", no canto inferior direito da barra de status (ou `Ctrl+Shift+P` → **PowerShell: Show Session Menu**), e escolha o Windows PowerShell (5.1) ou o PowerShell 7. Para cargas longas, prefira as tarefas: a depuração deixa a execução mais lenta.
 
 **5. Ver os resultados.** Abra a pasta de saída no VS Code (`File` → **Open Folder**, ou arraste para a barra lateral) para ver `_controle\manifesto_MG.csv`, os logs e os CSVs (com a Rainbow CSV, as colunas ficam alinhadas). Arquivos de vários GB são lentos no editor: para conferir, prefira o Power Query ou o SQL Server ([seções 10](#10-power-bi-power-query) e [11](#11-sql-server)). Não salve o manifesto nem o mapeamento pelo editor ou pelo Excel ([seção 9](#9-conferência-e-qualidade)).

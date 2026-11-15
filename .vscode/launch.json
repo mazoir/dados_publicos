@@ -1,19 +1,22 @@
 {
     // Depuração com a extensão PowerShell (F5 ou Run and Debug). Cada sessão abre um terminal temporário da
     // extensão, onde aparecem o log e as barras de progresso. Para só rodar, prefira as tarefas (tasks.json).
+    // Pontos de parada valem no fluxo principal: parâmetros, listagem do FTP, manifesto, consolidação e resumo.
+    // O download, o 7-Zip e o ETL rodam em paralelo em runspaces separados (e o motor padrão é C#): ali o depurador
+    // não para. Para investigar dados, use o log, o manifesto e o mapeamento de cabeçalhos (_controle).
     // Guia: docs/rais_caged_mg.md, seção 16.
     "version": "0.2.0",
     "inputs": [
         {
             "id": "argumentos",
             "type": "promptString",
-            "description": "Parâmetros do pipeline_rais_caged.ps1 (ex.: -Saida 'D:\\MTE' -Bases CAGED_MOV -AnoInicial 2024 -Consolidar)",
+            "description": "Parâmetros do pipeline_rais_caged.ps1 (ex.: -Saida ~\\Dados\\MTE -Bases CAGED_MOV -AnoInicial 2024 -Consolidar). Caminho com espaço: entre aspas simples",
             "default": "-SomenteListar"
         }
     ],
     "configurations": [
         {
-            "name": "MTE: simulação (-SomenteListar)",
+            "name": "MTE: simulação (-SomenteListar, pasta padrão ~\\Dados\\MTE)",
             "type": "PowerShell",
             "request": "launch",
             "script": "${workspaceFolder}/pipeline_rais_caged.ps1",
@@ -22,11 +25,11 @@
             "createTemporaryIntegratedConsole": true
         },
         {
-            "name": "MTE: teste rápido (CAGED exclusões de 2025, pasta de teste)",
+            "name": "MTE: teste rápido (CAGED exclusões de 2025, pasta ~\\Dados\\MTE_teste)",
             "type": "PowerShell",
             "request": "launch",
             "script": "${workspaceFolder}/pipeline_rais_caged.ps1",
-            "args": ["-Bases", "CAGED_EXC", "-AnoInicial", "2025", "-AnoFinal", "2025", "-Saida", "'${env:USERPROFILE}\\Dados\\MTE_teste'"],
+            "args": ["-Bases", "CAGED_EXC", "-AnoInicial", "2025", "-AnoFinal", "2025", "-Saida", "~\\Dados\\MTE_teste"],
             "cwd": "${workspaceFolder}",
             "createTemporaryIntegratedConsole": true
         },
